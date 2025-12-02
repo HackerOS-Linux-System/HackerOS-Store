@@ -1,4 +1,6 @@
-use iced::widget::{button, column, combo_box, container, row, scrollable, text, text_input, Column, Text};
+// src/main.rs
+
+use iced::widget::{button, column, combo_box, container, row, scrollable, text, text_input};
 use iced::{executor, Alignment, Application, Command, Element, Length, Settings, Theme};
 use std::process::Output;
 use tokio::process::Command as TokioCommand;
@@ -25,7 +27,7 @@ enum Message {
     SelectTool(String),
     UpdateArgs(String),
     RunCommand,
-    CommandFinished(Result<Output, anyhow::Error>),
+    CommandFinished(Result<Output, String>),
     SelectCommand(String),
 }
 
@@ -111,7 +113,8 @@ impl Application for HackerGui {
                             .args(full_args)
                             .output()
                             .await
-                            .map_err(anyhow::Error::from);
+                            .map(|o| o)
+                            .map_err(|e| e.to_string());
                         output
                     },
                     Message::CommandFinished,
@@ -191,8 +194,8 @@ impl Application for HackerGui {
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
+            .center_x()
+            .center_y()
             .into()
     }
 
