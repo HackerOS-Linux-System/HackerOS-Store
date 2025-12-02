@@ -1,5 +1,3 @@
-// src/main.rs
-
 use iced::widget::{button, column, combo_box, container, row, scrollable, text, text_input};
 use iced::{executor, Alignment, Application, Command, Element, Length, Settings, Theme};
 use std::process::Output;
