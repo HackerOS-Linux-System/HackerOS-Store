@@ -1,10 +1,6 @@
-// HackerOS Store - A simple store application for installing games launchers, pentest tools, applications, and drivers/hardware.
-// Inspired by RagataOS, but tailored for HackerOS.
-// Written in Vala with GTK4.
-// This application provides a GUI to install various items, with pentest tools installed in a Distrobox container (BlackArch) and wrappers created.
-
 using Gtk;
 using GLib;
+using Gdk;
 
 errordomain HackerError {
     FAILED,
@@ -16,7 +12,6 @@ public class HackerOSStore : Gtk.Application {
     private Gtk.Stack stack;
     private Gtk.ListBox category_list;
     private Gtk.Box main_box;
-
     // Categories
     private const string[] CATEGORIES = {
         "Game Launchers",
@@ -24,16 +19,13 @@ public class HackerOSStore : Gtk.Application {
         "Applications",
         "Drivers/Hardware"
     };
-
     // Items per category (as maps for simplicity: name -> description)
     private HashTable<string, string> game_launchers;
     private HashTable<string, string> pentest_tools;
     private HashTable<string, string> applications;
     private HashTable<string, string> drivers;
-
     public HackerOSStore() {
         Object(application_id: "com.hackeros.store", flags: ApplicationFlags.FLAGS_NONE);
-
         // Initialize item lists
         game_launchers = new HashTable<string, string>(str_hash, str_equal);
         game_launchers.insert("Steam", "Install Steam via Flatpak.");
@@ -41,7 +33,6 @@ public class HackerOSStore : Gtk.Application {
         game_launchers.insert("Battle.net", "Install Battle.net with Proton isolation.");
         game_launchers.insert("Epic Games Store", "Install Epic Games Store with Proton isolation.");
         game_launchers.insert("EA App", "Install EA App with Proton isolation.");
-
         pentest_tools = new HashTable<string, string>(str_hash, str_equal);
         pentest_tools.insert("nmap", "Network scanner.");
         pentest_tools.insert("metasploit", "Exploitation framework.");
@@ -60,32 +51,76 @@ public class HackerOSStore : Gtk.Application {
         pentest_tools.insert("dirbuster", "Directory and file brute-forcer.");
         pentest_tools.insert("enum4linux", "SMB enumeration tool.");
         pentest_tools.insert("gobuster", "Directory/file, DNS and VHost busting tool.");
-        pentest_tools.insert("Responder", "LLMNR/NBT-NS/mDNS poisoner.");
+        pentest_tools.insert("responder", "LLMNR/NBT-NS/mDNS poisoner.");
         pentest_tools.insert("impacket", "Collection of Python classes for working with network protocols.");
         pentest_tools.insert("crackmapexec", "Swiss army knife for pentesting networks.");
-
+        pentest_tools.insert("recon-ng", "Web reconnaissance framework.");
+        pentest_tools.insert("set", "Social-Engineer Toolkit.");
+        pentest_tools.insert("beef-xss", "Browser Exploitation Framework.");
+        pentest_tools.insert("volatility", "Memory forensics framework.");
+        pentest_tools.insert("autopsy", "Digital forensics platform.");
+        pentest_tools.insert("fierce", "DNS reconnaissance tool.");
+        pentest_tools.insert("dnsrecon", "DNS enumeration script.");
+        pentest_tools.insert("lbd", "Load Balancing Detector.");
+        pentest_tools.insert("knock", "Subdomain scan.");
+        pentest_tools.insert("arp-scan", "ARP scanning and fingerprinting tool.");
+        pentest_tools.insert("masscan", "Mass IP port scanner.");
+        pentest_tools.insert("sslscan", "SSL/TLS scanner.");
+        pentest_tools.insert("sslyze", "SSL configuration scanner.");
+        pentest_tools.insert("arachni", "Web application security scanner.");
+        pentest_tools.insert("wpscan", "WordPress vulnerability scanner.");
+        pentest_tools.insert("joomscan", "Joomla vulnerability scanner.");
+        pentest_tools.insert("cmsmap", "CMS scanner.");
+        pentest_tools.insert("droopescan", "Drupal scanner.");
+        pentest_tools.insert("openvas", "Open Vulnerability Assessment System.");
+        pentest_tools.insert("empire", "Post-exploitation framework.");
+        pentest_tools.insert("covenant", ".NET command and control framework.");
+        pentest_tools.insert("bloodhound", "Active Directory attack graph tool.");
+        pentest_tools.insert("evil-winrm", "WinRM shell for hacking/pentesting.");
+        pentest_tools.insert("chisel", "Fast TCP/UDP tunnel over HTTP.");
+        pentest_tools.insert("socat", "Multipurpose relay.");
+        pentest_tools.insert("netcat", "Network utility for reading/writing across networks.");
+        pentest_tools.insert("tcpdump", "Packet analyzer.");
+        pentest_tools.insert("hping3", "Network tool for sending custom packets.");
+        pentest_tools.insert("scapy", "Packet manipulation library.");
         applications = new HashTable<string, string>(str_hash, str_equal);
         applications.insert("Firefox", "Web browser.");
         applications.insert("VSCode", "Code editor.");
         applications.insert("LibreOffice", "Office suite.");
-
+        applications.insert("Thunderbird", "Email client.");
+        applications.insert("GIMP", "Image editor.");
+        applications.insert("Inkscape", "Vector graphics editor.");
+        applications.insert("Blender", "3D creation suite.");
+        applications.insert("VLC", "Media player.");
+        applications.insert("Audacity", "Audio editor.");
+        applications.insert("FileZilla", "FTP client.");
+        applications.insert("VirtualBox", "Virtualization software.");
+        applications.insert("Tor Browser", "Privacy-focused browser.");
+        applications.insert("KeePassXC", "Password manager.");
+        applications.insert("Wireshark", "Network protocol analyzer (standalone).");
         drivers = new HashTable<string, string>(str_hash, str_equal);
         drivers.insert("NVIDIA Driver", "Install NVIDIA graphics driver.");
         drivers.insert("AMD Driver", "Install AMD graphics driver.");
         drivers.insert("WiFi Drivers", "Install common WiFi drivers.");
     }
-
     protected override void activate() {
+        // Set up icon theme to load from resources
+        var display = Gdk.Display.get_default();
+        if (display != null) {
+            var icon_theme = Gtk.IconTheme.get_for_display(display);
+            icon_theme.add_resource_path("/com/hackeros/store/images");
+        }
+        // Set default icon name (without .png extension)
+        Gtk.Window.set_default_icon_name("Hacker-Unapck");
+
         window = new Gtk.Window() {
             title = "HackerOS Store",
             default_width = 800,
             default_height = 600
         };
         window.set_application(this);
-
         main_box = new Gtk.Box(Orientation.HORIZONTAL, 0);
         window.set_child(main_box);
-
         // Sidebar for categories
         var sidebar = new Gtk.Box(Orientation.VERTICAL, 10) {
             margin_top = 10,
@@ -98,23 +133,19 @@ public class HackerOSStore : Gtk.Application {
             css_classes = {"title-3"}
         };
         sidebar.append(category_label);
-
         category_list = new Gtk.ListBox() {
             selection_mode = SelectionMode.SINGLE,
             css_classes = {"navigation-sidebar"}
         };
         category_list.row_selected.connect(on_category_selected);
         sidebar.append(category_list);
-
         foreach (string category in CATEGORIES) {
             var row = new Gtk.ListBoxRow();
             var label = new Gtk.Label(category) { margin_start = 10, margin_end = 10 };
             row.set_child(label);
             category_list.append(row);
         }
-
         main_box.append(sidebar);
-
         // Stack for content
         stack = new Gtk.Stack() {
             vexpand = true,
@@ -125,7 +156,6 @@ public class HackerOSStore : Gtk.Application {
             margin_end = 10
         };
         main_box.append(stack);
-
         // Create pages for each category
         foreach (string category in CATEGORIES) {
             var scrolled = new Gtk.ScrolledWindow();
@@ -134,7 +164,6 @@ public class HackerOSStore : Gtk.Application {
             };
             scrolled.set_child(listbox);
             stack.add_named(scrolled, category);
-
             HashTable<string, string> items = get_items_for_category(category);
             if (items != null) {
                 items.foreach((name, desc) => {
@@ -143,10 +172,8 @@ public class HackerOSStore : Gtk.Application {
                 });
             }
         }
-
         window.present();
     }
-
     private HashTable<string, string>? get_items_for_category(string category) {
         switch (category) {
             case "Game Launchers": return game_launchers;
@@ -156,7 +183,6 @@ public class HackerOSStore : Gtk.Application {
             default: return null;
         }
     }
-
     private Gtk.ListBoxRow create_item_row(string name, string desc, string category) {
         var row = new Gtk.ListBoxRow();
         var box = new Gtk.Box(Orientation.HORIZONTAL, 10) {
@@ -176,7 +202,6 @@ public class HackerOSStore : Gtk.Application {
         row.set_child(box);
         return row;
     }
-
     private void on_category_selected(Gtk.ListBoxRow? row) {
         if (row != null) {
             var label = row.get_child() as Gtk.Label;
@@ -185,7 +210,6 @@ public class HackerOSStore : Gtk.Application {
             }
         }
     }
-
     private void on_install_clicked(string name, string category) {
         string message;
         try {
@@ -213,10 +237,8 @@ public class HackerOSStore : Gtk.Application {
         } catch (Error e) {
             message = "Error installing " + name + ": " + e.message;
         }
-
         show_message_dialog(message);
     }
-
     private void show_message_dialog(string message) {
         // Using Gtk.AlertDialog instead of deprecated MessageDialog
         var dialog = new Gtk.AlertDialog (message);
@@ -229,9 +251,7 @@ public class HackerOSStore : Gtk.Application {
             }
         });
     }
-
     // Installation methods
-
     private void install_game_launcher(string name) throws HackerError {
         switch (name) {
             case "Steam":
@@ -253,7 +273,6 @@ public class HackerOSStore : Gtk.Application {
                 throw new HackerError.NOT_SUPPORTED("Unsupported launcher");
         }
     }
-
     private void install_steam() throws HackerError {
         // Check if Flatpak is configured, add Flathub if not, install Steam
         string out_str = "";
@@ -265,7 +284,6 @@ public class HackerOSStore : Gtk.Application {
         } catch (SpawnError e) {
             throw new HackerError.FAILED("Failed to check flatpak remotes: " + e.message);
         }
-
         if (success && !out_str.contains("flathub")) {
             try {
                 success = Process.spawn_command_line_sync("flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo", null, null, out status);
@@ -274,7 +292,6 @@ public class HackerOSStore : Gtk.Application {
             }
             if (!success || status != 0) throw new HackerError.FAILED("Failed to add Flathub");
         }
-
         try {
             success = Process.spawn_command_line_sync("flatpak install -y flathub com.valvesoftware.Steam", null, null, out status);
         } catch (SpawnError e) {
@@ -282,19 +299,15 @@ public class HackerOSStore : Gtk.Application {
         }
         if (!success || status != 0) throw new HackerError.FAILED("Failed to install Steam");
     }
-
     private void install_with_proton_isolation(string name, string id) throws HackerError {
         // Install Proton-GE if not present
         install_proton_ge();
-
         var home = Environment.get_home_dir();
         var proton_dir = Path.build_filename(home, ".hackeros", "proton");
         var proton_path = Path.build_filename(proton_dir, "proton");
-
         var launchers_dir = Path.build_filename(home, ".hackeros", "launchers", id);
         var prefix = Path.build_filename(launchers_dir, "prefix");
         DirUtils.create_with_parents(prefix, 0755);
-
         // Download installer
         string url = get_launcher_url(id);
         string ext = (id == "epic") ? ".msi" : ".exe";
@@ -306,7 +319,6 @@ public class HackerOSStore : Gtk.Application {
             throw new HackerError.FAILED("Failed to download installer for " + name + ": " + e.message);
         }
         if (!success) throw new HackerError.FAILED("Failed to download installer for " + name);
-
         // Run installer with Proton
         string run_cmd;
         if (id == "epic") {
@@ -314,10 +326,8 @@ public class HackerOSStore : Gtk.Application {
         } else {
             run_cmd = proton_path + " run " + installer_file;
         }
-
         Environment.set_variable("STEAM_COMPAT_DATA_PATH", prefix, true);
         Environment.set_variable("STEAM_COMPAT_CLIENT_INSTALL_PATH", home + "/.steam/steam", true); // Assume Steam is installed, or dummy
-
         int status = 0;
         try {
             success = Process.spawn_command_line_sync(run_cmd, null, null, out status);
@@ -325,10 +335,8 @@ public class HackerOSStore : Gtk.Application {
             throw new HackerError.FAILED("Failed to run installer for " + name + ": " + e.message);
         }
         if (!success || status != 0) throw new HackerError.FAILED("Failed to run installer for " + name + ". Please check if the installer ran correctly.");
-
         // Get installed exe path
         string exe_path = get_installed_exe_path(id, prefix);
-
         // Create .desktop file
         var desktop_dir = Path.build_filename(Environment.get_user_data_dir(), "applications");
         DirUtils.create_with_parents(desktop_dir, 0755);
@@ -340,16 +348,13 @@ public class HackerOSStore : Gtk.Application {
             throw new HackerError.FAILED("Failed to create desktop file: " + e.message);
         }
     }
-
     private void install_proton_ge() throws HackerError {
         var home = Environment.get_home_dir();
         var proton_dir = Path.build_filename(home, ".hackeros", "proton");
         var proton_path = Path.build_filename(proton_dir, "proton");
-
         if (File.new_for_path(proton_path).query_exists()) {
             return; // Already installed
         }
-
         // Get latest Proton-GE URL
         string url_out = "";
         bool success = false;
@@ -360,9 +365,7 @@ public class HackerOSStore : Gtk.Application {
         }
         if (!success) throw new HackerError.FAILED("Failed to get Proton-GE download URL");
         string url = url_out.strip();
-
         if (url == "") throw new HackerError.FAILED("No Proton-GE URL found");
-
         var tar_file = "/tmp/proton-ge.tar.gz";
         try {
             success = Process.spawn_command_line_sync(@"wget -O $tar_file $url", null, null);
@@ -370,7 +373,6 @@ public class HackerOSStore : Gtk.Application {
             throw new HackerError.FAILED("Failed to download Proton-GE: " + e.message);
         }
         if (!success) throw new HackerError.FAILED("Failed to download Proton-GE");
-
         DirUtils.create_with_parents(proton_dir, 0755);
         try {
             success = Process.spawn_command_line_sync(@"tar -xzf $tar_file -C $proton_dir --strip-components=1", null, null);
@@ -378,14 +380,12 @@ public class HackerOSStore : Gtk.Application {
             throw new HackerError.FAILED("Failed to extract Proton-GE: " + e.message);
         }
         if (!success) throw new HackerError.FAILED("Failed to extract Proton-GE");
-
         try {
             FileUtils.remove(tar_file); // Cleanup
         } catch (FileError e) {
             // Ignore cleanup error
         }
     }
-
     private string get_launcher_url(string id) {
         switch (id) {
             case "gog": return "https://webinstallers.gog.com/galaxy_installer_en.exe";
@@ -395,7 +395,6 @@ public class HackerOSStore : Gtk.Application {
             default: return "";
         }
     }
-
     private string get_installed_exe_path(string id, string prefix) {
         string drive_c = Path.build_filename(prefix, "drive_c");
         switch (id) {
@@ -406,7 +405,6 @@ public class HackerOSStore : Gtk.Application {
             default: return "";
         }
     }
-
     private void install_pentest_tool(string name) throws HackerError {
         // Install Distrobox if not present
         int status = 0;
@@ -425,7 +423,6 @@ public class HackerOSStore : Gtk.Application {
             }
             if (!success || status != 0) throw new HackerError.FAILED("Failed to install Distrobox");
         }
-
         // Create BlackArch container if not exists
         try {
             success = Process.spawn_command_line_sync("distrobox create --image blackarchlinux/blackarch --name blackarch-pentest", null, null, out status);
@@ -435,7 +432,6 @@ public class HackerOSStore : Gtk.Application {
         if (!success || (status != 0 && status != 1)) { // 1 might mean already exists
             throw new HackerError.FAILED("Failed to create BlackArch container");
         }
-
         // Install tool inside container
         try {
             success = Process.spawn_command_line_sync(@"distrobox enter blackarch-pentest -- sudo pacman -Syu --noconfirm $name", null, null, out status);
@@ -443,7 +439,6 @@ public class HackerOSStore : Gtk.Application {
             throw new HackerError.FAILED("Failed to install " + name + ": " + e.message);
         }
         if (!success || status != 0) throw new HackerError.FAILED("Failed to install " + name);
-
         // Create wrapper: a script that runs distrobox enter blackarch-pentest -- name
         var wrapper_path = Path.build_filename(Environment.get_home_dir(), ".local", "bin", name + "-pentest");
         DirUtils.create_with_parents(Path.get_dirname(wrapper_path), 0755);
@@ -459,7 +454,6 @@ public class HackerOSStore : Gtk.Application {
             throw new HackerError.FAILED("Failed to make wrapper executable: " + e.message);
         }
         if (!success || status != 0) throw new HackerError.FAILED("Failed to make wrapper executable");
-
         // Create .desktop if needed
         var desktop_file = Path.build_filename(Environment.get_user_data_dir(), "applications", name + "-pentest.desktop");
         var desktop_content = "[Desktop Entry]\nName=" + name + " (Pentest)\nExec=" + wrapper_path + "\nType=Application\n";
@@ -469,7 +463,6 @@ public class HackerOSStore : Gtk.Application {
             throw new HackerError.FAILED("Failed to create desktop file: " + e.message);
         }
     }
-
     private void install_application(string name) throws HackerError {
         // Placeholder: install via flatpak or apt, assuming flatpak for cross-distro
         string flatpak_id;
@@ -477,6 +470,17 @@ public class HackerOSStore : Gtk.Application {
             case "Firefox": flatpak_id = "org.mozilla.firefox"; break;
             case "VSCode": flatpak_id = "com.visualstudio.code"; break;
             case "LibreOffice": flatpak_id = "org.libreoffice.LibreOffice"; break;
+            case "Thunderbird": flatpak_id = "org.mozilla.Thunderbird"; break;
+            case "GIMP": flatpak_id = "org.gimp.GIMP"; break;
+            case "Inkscape": flatpak_id = "org.inkscape.Inkscape"; break;
+            case "Blender": flatpak_id = "org.blender.Blender"; break;
+            case "VLC": flatpak_id = "org.videolan.VLC"; break;
+            case "Audacity": flatpak_id = "org.audacityteam.Audacity"; break;
+            case "FileZilla": flatpak_id = "org.filezillaproject.Filezilla"; break;
+            case "VirtualBox": flatpak_id = "org.virtualbox.VirtualBox"; break;
+            case "Tor Browser": flatpak_id = "com.github.micahflee.torbrowser-launcher"; break;
+            case "KeePassXC": flatpak_id = "org.keepassxc.KeePassXC"; break;
+            case "Wireshark": flatpak_id = "org.wireshark.Wireshark"; break;
             default: throw new HackerError.NOT_SUPPORTED("Unsupported application");
         }
         int status = 0;
@@ -488,13 +492,12 @@ public class HackerOSStore : Gtk.Application {
         }
         if (!success || status != 0) throw new HackerError.FAILED("Failed to install " + name);
     }
-
     private void install_driver(string name) throws HackerError {
         // Placeholder: system-specific driver installation, e.g., via apt or dnf
         // Assuming Ubuntu-like for example
         string pkg;
         switch (name) {
-            case "NVIDIA Driver": pkg = "nvidia-driver"; break;
+            case "NVIDIA Driver": pkg = "nvidia-driver nvidia-kernel-dkms nvidia-smi libnvidia-ml1 nvidia-settings nvidia-cuda-mps"; break;
             case "AMD Driver": pkg = "amdgpu"; break;
             case "WiFi Drivers": pkg = "broadcom-wl"; break; // Example
             default: throw new HackerError.NOT_SUPPORTED("Unsupported driver");
@@ -508,7 +511,6 @@ public class HackerOSStore : Gtk.Application {
         }
         if (!success || status != 0) throw new HackerError.FAILED("Failed to install " + name);
     }
-
     public static int main(string[] args) {
         return new HackerOSStore().run(args);
     }
