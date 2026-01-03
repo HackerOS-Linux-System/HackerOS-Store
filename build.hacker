@@ -1,1 +1,8 @@
+// meson
+// ninja-build
+// valac 
+// libgtk-4-dev
 
+> cd source-code
+> meson setup build
+> meson compile -C build
