@@ -12,7 +12,7 @@ dependencies = [
   gobject_dep,
 ]
 
-sources = files('hackeros_store.vala')
+sources = files('main.vala')
 
 executable('hackeros-store', sources,
   dependencies: dependencies,
