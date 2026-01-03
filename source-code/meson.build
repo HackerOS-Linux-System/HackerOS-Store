@@ -1,5 +1,5 @@
-project('HackerOS-Store', 'vala', 'c',
-  version: '0.1',
+project('hackeros-store', 'vala', 'c',
+  version: '0.4',
   default_options: ['warning_level=3'])
 
 gtk4_dep = dependency('gtk4')
