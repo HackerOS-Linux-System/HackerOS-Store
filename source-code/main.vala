@@ -12,6 +12,7 @@ public class HackerOSStore : Gtk.Application {
     private Gtk.Stack stack;
     private Gtk.ListBox category_list;
     private Gtk.Box main_box;
+
     // Categories
     private const string[] CATEGORIES = {
         "Game Launchers",
@@ -19,13 +20,16 @@ public class HackerOSStore : Gtk.Application {
         "Applications",
         "Drivers/Hardware"
     };
+
     // Items per category (as maps for simplicity: name -> description)
     private HashTable<string, string> game_launchers;
     private HashTable<string, string> pentest_tools;
     private HashTable<string, string> applications;
     private HashTable<string, string> drivers;
+
     public HackerOSStore() {
         Object(application_id: "com.hackeros.store", flags: ApplicationFlags.FLAGS_NONE);
+
         // Initialize item lists
         game_launchers = new HashTable<string, string>(str_hash, str_equal);
         game_launchers.insert("Steam", "Install Steam via Flatpak.");
@@ -33,6 +37,7 @@ public class HackerOSStore : Gtk.Application {
         game_launchers.insert("Battle.net", "Install Battle.net with Proton isolation.");
         game_launchers.insert("Epic Games Store", "Install Epic Games Store with Proton isolation.");
         game_launchers.insert("EA App", "Install EA App with Proton isolation.");
+
         pentest_tools = new HashTable<string, string>(str_hash, str_equal);
         pentest_tools.insert("nmap", "Network scanner.");
         pentest_tools.insert("metasploit", "Exploitation framework.");
@@ -83,6 +88,7 @@ public class HackerOSStore : Gtk.Application {
         pentest_tools.insert("tcpdump", "Packet analyzer.");
         pentest_tools.insert("hping3", "Network tool for sending custom packets.");
         pentest_tools.insert("scapy", "Packet manipulation library.");
+
         applications = new HashTable<string, string>(str_hash, str_equal);
         applications.insert("Firefox", "Web browser.");
         applications.insert("VSCode", "Code editor.");
@@ -98,20 +104,55 @@ public class HackerOSStore : Gtk.Application {
         applications.insert("Tor Browser", "Privacy-focused browser.");
         applications.insert("KeePassXC", "Password manager.");
         applications.insert("Wireshark", "Network protocol analyzer (standalone).");
+
         drivers = new HashTable<string, string>(str_hash, str_equal);
         drivers.insert("NVIDIA Driver", "Install NVIDIA graphics driver.");
         drivers.insert("AMD Driver", "Install AMD graphics driver.");
         drivers.insert("WiFi Drivers", "Install common WiFi drivers.");
     }
+
     protected override void activate() {
-        // Set up icon theme to load from resources
-        var display = Gdk.Display.get_default();
-        if (display != null) {
-            var icon_theme = Gtk.IconTheme.get_for_display(display);
-            icon_theme.add_resource_path("/com/hackeros/store/images");
+        // Prefer dark theme
+        var settings = Gtk.Settings.get_default();
+        if (settings != null) {
+            settings.gtk_application_prefer_dark_theme = true;
         }
-        // Set default icon name (without .png extension)
-        Gtk.Window.set_default_icon_name("Hacker-Unapck");
+
+        // CSS for custom styling
+        var display = Gdk.Display.get_default();
+        var css_provider = new Gtk.CssProvider();
+        css_provider.load_from_data("""
+        window {
+        background-color: #1e1e1e;
+        color: #ffffff;
+    }
+    .navigation-sidebar {
+    background-color: #2d2d2d;
+    border-right: 1px solid #3d3d3d;
+    }
+    .content {
+    background-color: #1e1e1e;
+    }
+    .item-name {
+    font-weight: bold;
+    font-size: 1.2em;
+    }
+    .item-desc {
+    color: #aaaaaa;
+    }
+    button.install {
+    background-color: #0d8;
+    color: #000000;
+    border-radius: 5px;
+    padding: 6px 12px;
+    }
+    button.install:hover {
+    background-color: #0ea;
+    }
+    """.data);
+        if (display != null) {
+            Gtk.StyleContext.add_provider_for_display(display, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
+        }
 
         window = new Gtk.Window() {
             title = "HackerOS Store",
@@ -119,8 +160,16 @@ public class HackerOSStore : Gtk.Application {
             default_height = 600
         };
         window.set_application(this);
+
+        // Use HeaderBar for modern look
+        var header_bar = new Gtk.HeaderBar();
+        header_bar.set_show_title_buttons(true);
+        header_bar.set_title_widget(new Gtk.Label("HackerOS Store"));
+        window.set_titlebar(header_bar);
+
         main_box = new Gtk.Box(Orientation.HORIZONTAL, 0);
         window.set_child(main_box);
+
         // Sidebar for categories
         var sidebar = new Gtk.Box(Orientation.VERTICAL, 10) {
             margin_top = 10,
@@ -133,19 +182,28 @@ public class HackerOSStore : Gtk.Application {
             css_classes = {"title-3"}
         };
         sidebar.append(category_label);
+
         category_list = new Gtk.ListBox() {
             selection_mode = SelectionMode.SINGLE,
             css_classes = {"navigation-sidebar"}
         };
         category_list.row_selected.connect(on_category_selected);
         sidebar.append(category_list);
+
         foreach (string category in CATEGORIES) {
             var row = new Gtk.ListBoxRow();
-            var label = new Gtk.Label(category) { margin_start = 10, margin_end = 10 };
-            row.set_child(label);
+            var hbox = new Gtk.Box(Orientation.HORIZONTAL, 5);
+            var icon = new Gtk.Image.from_icon_name(get_category_icon(category));
+            icon.set_pixel_size(24);
+            hbox.append(icon);
+            var label = new Gtk.Label(category) { margin_start = 5, margin_end = 10 };
+            hbox.append(label);
+            row.set_child(hbox);
             category_list.append(row);
         }
+
         main_box.append(sidebar);
+
         // Stack for content
         stack = new Gtk.Stack() {
             vexpand = true,
@@ -156,14 +214,17 @@ public class HackerOSStore : Gtk.Application {
             margin_end = 10
         };
         main_box.append(stack);
+
         // Create pages for each category
         foreach (string category in CATEGORIES) {
             var scrolled = new Gtk.ScrolledWindow();
             var listbox = new Gtk.ListBox() {
-                selection_mode = SelectionMode.NONE
+                selection_mode = SelectionMode.NONE,
+                css_classes = {"content"}
             };
             scrolled.set_child(listbox);
             stack.add_named(scrolled, category);
+
             HashTable<string, string> items = get_items_for_category(category);
             if (items != null) {
                 items.foreach((name, desc) => {
@@ -172,8 +233,20 @@ public class HackerOSStore : Gtk.Application {
                 });
             }
         }
+
         window.present();
     }
+
+    private string get_category_icon(string category) {
+        switch (category) {
+            case "Game Launchers": return "input-gaming-symbolic";
+            case "Pentest Tools": return "security-high-symbolic";
+            case "Applications": return "applications-system-symbolic";
+            case "Drivers/Hardware": return "drive-harddisk-symbolic";
+            default: return "folder-symbolic";
+        }
+    }
+
     private HashTable<string, string>? get_items_for_category(string category) {
         switch (category) {
             case "Game Launchers": return game_launchers;
@@ -183,33 +256,74 @@ public class HackerOSStore : Gtk.Application {
             default: return null;
         }
     }
+
     private Gtk.ListBoxRow create_item_row(string name, string desc, string category) {
         var row = new Gtk.ListBoxRow();
-        var box = new Gtk.Box(Orientation.HORIZONTAL, 10) {
-            margin_top = 5,
-            margin_bottom = 5,
+        var main_box = new Gtk.Box(Orientation.HORIZONTAL, 10) {
+            margin_top = 10,
+            margin_bottom = 10,
             margin_start = 10,
             margin_end = 10
         };
-        var label = new Gtk.Label(name + ": " + desc) {
-            hexpand = true,
-            halign = Align.START
+
+        // Optional icon for item
+        var icon = new Gtk.Image.from_icon_name(get_item_icon(name, category));
+        icon.set_pixel_size(48);
+        main_box.append(icon);
+
+        var text_box = new Gtk.Box(Orientation.VERTICAL, 5) {
+            hexpand = true
         };
-        var install_button = new Gtk.Button.with_label("Install");
+        var name_label = new Gtk.Label(name) {
+            halign = Align.START,
+            css_classes = {"item-name"}
+        };
+        var desc_label = new Gtk.Label(desc) {
+            halign = Align.START,
+            wrap = true,
+            css_classes = {"item-desc"}
+        };
+        text_box.append(name_label);
+        text_box.append(desc_label);
+        main_box.append(text_box);
+
+        var install_button = new Gtk.Button.with_label("Install") {
+            valign = Align.CENTER,
+            css_classes = {"install"}
+        };
         install_button.clicked.connect(() => on_install_clicked(name, category));
-        box.append(label);
-        box.append(install_button);
-        row.set_child(box);
+        main_box.append(install_button);
+
+        row.set_child(main_box);
         return row;
     }
+
+    private string get_item_icon(string name, string category) {
+        // Simple mapping, can be expanded
+        if (category == "Game Launchers") {
+            return "input-gaming-symbolic";
+        } else if (category == "Pentest Tools") {
+            return "security-medium-symbolic";
+        } else if (category == "Applications") {
+            return "application-x-executable-symbolic";
+        } else if (category == "Drivers/Hardware") {
+            return "drive-harddisk-symbolic";
+        }
+        return "application-x-addon-symbolic";
+    }
+
     private void on_category_selected(Gtk.ListBoxRow? row) {
         if (row != null) {
-            var label = row.get_child() as Gtk.Label;
-            if (label != null) {
-                stack.set_visible_child_name(label.get_text());
+            var hbox = row.get_child() as Gtk.Box;
+            if (hbox != null) {
+                var label = hbox.get_last_child() as Gtk.Label;
+                if (label != null) {
+                    stack.set_visible_child_name(label.get_text());
+                }
             }
         }
     }
+
     private void on_install_clicked(string name, string category) {
         string message;
         try {
@@ -239,6 +353,7 @@ public class HackerOSStore : Gtk.Application {
         }
         show_message_dialog(message);
     }
+
     private void show_message_dialog(string message) {
         // Using Gtk.AlertDialog instead of deprecated MessageDialog
         var dialog = new Gtk.AlertDialog (message);
@@ -251,6 +366,7 @@ public class HackerOSStore : Gtk.Application {
             }
         });
     }
+
     // Installation methods
     private void install_game_launcher(string name) throws HackerError {
         switch (name) {
@@ -273,6 +389,7 @@ public class HackerOSStore : Gtk.Application {
                 throw new HackerError.NOT_SUPPORTED("Unsupported launcher");
         }
     }
+
     private void install_steam() throws HackerError {
         // Check if Flatpak is configured, add Flathub if not, install Steam
         string out_str = "";
@@ -299,6 +416,7 @@ public class HackerOSStore : Gtk.Application {
         }
         if (!success || status != 0) throw new HackerError.FAILED("Failed to install Steam");
     }
+
     private void install_with_proton_isolation(string name, string id) throws HackerError {
         // Install Proton-GE if not present
         install_proton_ge();
@@ -348,6 +466,7 @@ public class HackerOSStore : Gtk.Application {
             throw new HackerError.FAILED("Failed to create desktop file: " + e.message);
         }
     }
+
     private void install_proton_ge() throws HackerError {
         var home = Environment.get_home_dir();
         var proton_dir = Path.build_filename(home, ".hackeros", "proton");
@@ -386,6 +505,7 @@ public class HackerOSStore : Gtk.Application {
             // Ignore cleanup error
         }
     }
+
     private string get_launcher_url(string id) {
         switch (id) {
             case "gog": return "https://webinstallers.gog.com/galaxy_installer_en.exe";
@@ -395,6 +515,7 @@ public class HackerOSStore : Gtk.Application {
             default: return "";
         }
     }
+
     private string get_installed_exe_path(string id, string prefix) {
         string drive_c = Path.build_filename(prefix, "drive_c");
         switch (id) {
@@ -405,6 +526,7 @@ public class HackerOSStore : Gtk.Application {
             default: return "";
         }
     }
+
     private void install_pentest_tool(string name) throws HackerError {
         // Install Distrobox if not present
         int status = 0;
@@ -463,6 +585,7 @@ public class HackerOSStore : Gtk.Application {
             throw new HackerError.FAILED("Failed to create desktop file: " + e.message);
         }
     }
+
     private void install_application(string name) throws HackerError {
         // Placeholder: install via flatpak or apt, assuming flatpak for cross-distro
         string flatpak_id;
@@ -492,6 +615,7 @@ public class HackerOSStore : Gtk.Application {
         }
         if (!success || status != 0) throw new HackerError.FAILED("Failed to install " + name);
     }
+
     private void install_driver(string name) throws HackerError {
         // Placeholder: system-specific driver installation, e.g., via apt or dnf
         // Assuming Ubuntu-like for example
@@ -511,6 +635,7 @@ public class HackerOSStore : Gtk.Application {
         }
         if (!success || status != 0) throw new HackerError.FAILED("Failed to install " + name);
     }
+
     public static int main(string[] args) {
         return new HackerOSStore().run(args);
     }
