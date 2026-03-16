@@ -1,17 +1,19 @@
 project('HackerOS-Store', 'vala', 'c',
-  version: '0.5',
-  default_options: ['warning_level=3'])
+  version: '0.6',
+  default_options: ['warning_level=2'])
 
-gtk4_dep = dependency('gtk4')
-glib_dep = dependency('glib-2.0')
+gtk4_dep    = dependency('gtk4')
+glib_dep    = dependency('glib-2.0')
 gobject_dep = dependency('gobject-2.0')
-soup_dep = dependency('libsoup-3.0')
-json_dep = dependency('json-glib-1.0')
+gio_dep     = dependency('gio-2.0')
+soup_dep    = dependency('libsoup-3.0')
+json_dep    = dependency('json-glib-1.0')
 
 dependencies = [
   gtk4_dep,
   glib_dep,
   gobject_dep,
+  gio_dep,
   soup_dep,
   json_dep,
 ]
