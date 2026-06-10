@@ -1,8 +1,7 @@
-// meson
-// ninja-build
-// valac 
-// libgtk-4-dev
+// npm
+// rustc
+// cargo
 
 > cd source-code
-> meson setup build
-> meson compile -C build
+> npm install
+> npm run tauri build
