@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability granted to the main HackerOS Store window. Grants the core IPC permissions needed to invoke this app's own #[tauri::command] handlers (install_package, uninstall_package, cancel_install, update_system, check_updates_available, check_all_installed, discover_categories, discover_browse, discover_search, discover_install, discover_uninstall, get_app_details, get_installed_sets, get_package_info, get_settings, save_settings, reset_settings, get_app_info, clear_cache) plus the baseline window/event permissions the frontend relies on (event listen for install_progress/install_log, window controls). Outbound HTTPS calls (Flathub, ODRS ratings) are made from the Rust backend via reqwest, not through a Tauri HTTP plugin, so no extra network capability entry is needed here.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}
