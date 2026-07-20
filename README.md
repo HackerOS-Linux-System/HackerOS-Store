@@ -1,6 +1,6 @@
 # HackerOS Store
 
-![HackerOS Store](https://github.com/HackerOS-Linux-System/HackerOS-Updates/blob/main/HackerOS/ICONS/Hacker-Unpack.png)
+![HackerOS Store](https://github.com/HackerOS-Linux-System/HackerOS-Updates/blob/main/HackerOS/ICONS/HackerOS-Store.png)
 
 A desktop app store for **HackerOS** (a Debian-based Linux distribution) that lets you search,
 install, and manage software from **apt, Flatpak, Snap, and Homebrew/Linuxbrew** in one place,
