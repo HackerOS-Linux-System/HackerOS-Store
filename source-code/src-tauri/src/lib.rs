@@ -11,6 +11,16 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 
+mod security;
+mod ratings;
+mod history;
+mod queue_store;
+mod hpm;
+mod hnm;
+mod appimage;
+
+use security::validate_pkg_token;
+
 // ─── Event payloads ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -35,17 +45,40 @@ pub struct InstalledState {
 
 /// A single result row in the Discover browse/search view. Unlike the old
 /// hardcoded "featured apps" list, every row here comes from a live query
-/// against the enabled package sources (apt/flatpak/snap/brew) — there is no
-/// static catalog backing this type any more.
+/// against the enabled package sources
+/// (apt/flatpak/snap/brew/hpm/appimage) — there is no static catalog
+/// backing this type any more.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DiscoverResult {
     pub name: String,
     pub version: String,
     pub desc: String,
-    pub source: String,        // "apt" | "flatpak" | "snap" | "brew"
-    pub package_id: String,    // id used to install/uninstall/query details
+    pub source: String,        // "apt" | "flatpak" | "snap" | "brew" | "hpm" | "appimage"
+    pub package_id: String,    // id used to install/uninstall/query details ("owner/repo" for appimage)
     pub size: Option<String>,
     pub icon: Option<String>,  // "data:image/png;base64,..." | None (frontend falls back to a source badge icon)
+}
+
+/// One source's problem during a Discover query — shown alongside results
+/// rather than just silently reducing the result count. Distinguishes "this
+/// source is fine, it just has 0 matches" (no `SourceIssue` at all) from
+/// "this source didn't get a chance to answer" (timeout/unavailable/error),
+/// which previously looked identical to the person: fewer results, no
+/// explanation. The blanket "every source failed" case the frontend
+/// already handled is still just `results.is_empty() && !issues.is_empty()`
+/// with `issues.len() == enabled_sources.len()`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SourceIssue {
+    pub source: String,
+    /// "timeout" | "unavailable" | "error"
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct DiscoverResponse {
+    pub results: Vec<DiscoverResult>,
+    pub issues: Vec<SourceIssue>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -82,6 +115,17 @@ pub struct AppDetails {
     pub categories: Vec<String>,
     pub size: Option<String>,
     pub rating: Option<RatingInfo>,
+    /// Locally-stored community rating (this machine's own submitted
+    /// ratings/reviews). Unlike `rating` (ODRS, Flatpak-only), this is
+    /// populated for every source — apt, flatpak, snap, and brew.
+    pub local_rating: Option<RatingInfo>,
+    /// Snap only: "strict" | "classic" | "devmode", parsed from
+    /// `snap info`. `Some("classic")` is what makes `snap_install`
+    /// automatically add `--classic` instead of failing with a raw CLI
+    /// error — surfaced here too so the frontend can show a "requires
+    /// classic confinement (broader system access)" notice before install.
+    #[serde(default)]
+    pub confinement: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -90,6 +134,28 @@ pub struct InstalledSets {
     pub flatpak: Vec<String>,
     pub snap: Vec<String>,
     pub brew: Vec<String>,
+    #[serde(default)]
+    pub hpm: Vec<String>,
+    /// Packages installed via `hnm` (HackerOS Nix Manager), keyed by the
+    /// bare nixpkgs attribute name (e.g. "ripgrep"), same as `package_id`
+    /// for this source.
+    #[serde(default)]
+    pub nix: Vec<String>,
+    /// Installed AppImages, keyed by "owner/repo" (matches `package_id`
+    /// for this source) rather than a display name — same convention
+    /// `flatpak` already uses (app-id, not label).
+    #[serde(default)]
+    pub appimage: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct FlatpakRemote {
+    /// The name flatpak knows it by, e.g. "flathub" or "flathub-beta" —
+    /// used verbatim as the `<remote>` argument to `flatpak remote-add`/
+    /// `install`/`remote-info`, so it goes through `validate_pkg_token`
+    /// wherever it's used in a command.
+    pub name: String,
+    pub url: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -98,8 +164,27 @@ pub struct AppSettings {
     /// tables; the backend only persists the chosen code.
     #[serde(default = "default_language")]
     pub language: String,
-    /// Flatpak remote URL used when (re-)adding the Flathub remote.
-    /// Lets the user switch to a regional mirror if Flathub is slow/blocked.
+    /// Configured Flatpak remotes. Defaults to just Flathub, but a person
+    /// can add Flathub Beta (`https://dl.flathub.org/beta-repo/flathub-beta.flatpakrepo`),
+    /// a regional mirror, or any other ostree remote alongside it —
+    /// `ensure_flatpak` adds all of them, not just one hardcoded remote.
+    #[serde(default = "default_flatpak_remotes")]
+    pub flatpak_remotes: Vec<FlatpakRemote>,
+    /// Which configured remote (by `FlatpakRemote.name`) Discover installs/
+    /// searches/shows remote-info against by default.
+    #[serde(default = "default_flatpak_default_remote")]
+    pub flatpak_default_remote: String,
+    /// Default branch (`flatpak install <remote> <id>//<branch>`) used when
+    /// a Discover install doesn't explicitly pick one. Empty string means
+    /// "the remote's own default branch" (almost always "stable" — flatpak
+    /// itself decides, we just don't force one).
+    #[serde(default)]
+    pub flatpak_default_branch: String,
+    /// Deprecated, superseded by `flatpak_remotes`/`flatpak_default_remote`.
+    /// Kept only so a `settings.json` written by an older version of this
+    /// app still deserializes instead of silently losing a person's custom
+    /// mirror URL — `current_settings()` migrates it into `flatpak_remotes`
+    /// the first time it's read. Nothing else reads this field any more.
     #[serde(default = "default_flatpak_remote")]
     pub flatpak_remote_url: String,
     /// Optional custom APT mirror (host only, e.g. "deb.debian.org").
@@ -110,9 +195,19 @@ pub struct AppSettings {
     #[serde(default = "default_true")]
     pub check_updates_on_startup: bool,
     /// Which package sources Discover should query. Subset of
-    /// ["apt","flatpak","snap","brew"]. Lets a person turn off a source
-    /// they don't have installed (or don't trust) instead of always
-    /// paying the query cost / seeing errors for it.
+    /// ["apt","flatpak","snap","brew","hpm","nix","appimage"]. Lets a
+    /// person turn off a source they don't have installed (or don't
+    /// trust) instead of always paying the query cost / seeing errors
+    /// for it.
+    /// "appimage" is deliberately *not* in the default set (see
+    /// `default_sources`) — unlike the others it depends on a
+    /// third-party community feed and does its own desktop-file/icon
+    /// integration on install, so it's opt-in rather than on by default.
+    /// "nix" (via `hnm`) is likewise opt-in: its local package index
+    /// (`~/.local/share/hnm/pkgdb.tsv`) has to be built once with
+    /// `hnm update` before search returns anything, and a from-scratch
+    /// Nix bootstrap on first install can take several minutes — both
+    /// unlike the always-ready system package managers.
     /// `#[serde(default = ...)]` here (and on the fields below) means a
     /// settings.json written by an older version of this app — before these
     /// fields existed — still deserializes successfully instead of falling
@@ -120,6 +215,11 @@ pub struct AppSettings {
     /// saved mirror/language/etc. preferences.
     #[serde(default = "default_sources")]
     pub enabled_sources: Vec<String>,
+    /// Default snap channel/track (`--channel=`) used when a Discover
+    /// install doesn't explicitly pick one. "stable" = flatpak-style
+    /// default, so `snap_install` simply omits `--channel` in that case.
+    #[serde(default = "default_snap_channel")]
+    pub snap_default_channel: String,
     /// Whether to fetch community star ratings from the GNOME ODRS service
     /// for Flatpak apps in the detail view. Off by default for anyone who
     /// doesn't want the app phoning home at all.
@@ -132,18 +232,27 @@ pub struct AppSettings {
 
 fn default_language() -> String { "en".into() }
 fn default_flatpak_remote() -> String { "https://dl.flathub.org/repo/flathub.flatpakrepo".into() }
+fn default_flatpak_remotes() -> Vec<FlatpakRemote> {
+    vec![FlatpakRemote { name: "flathub".into(), url: default_flatpak_remote() }]
+}
+fn default_flatpak_default_remote() -> String { "flathub".into() }
+fn default_snap_channel() -> String { "stable".into() }
 fn default_true() -> bool { true }
-fn default_sources() -> Vec<String> { vec!["apt".into(), "flatpak".into(), "snap".into(), "brew".into()] }
+fn default_sources() -> Vec<String> { vec!["apt".into(), "flatpak".into(), "snap".into(), "brew".into(), "hpm".into()] }
 fn default_section() -> String { "discover".into() }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             language: "en".into(),
-            flatpak_remote_url: "https://dl.flathub.org/repo/flathub.flatpakrepo".into(),
+            flatpak_remotes: default_flatpak_remotes(),
+            flatpak_default_remote: default_flatpak_default_remote(),
+            flatpak_default_branch: String::new(),
+            flatpak_remote_url: default_flatpak_remote(),
             apt_mirror: String::new(),
             check_updates_on_startup: true,
-            enabled_sources: vec!["apt".into(), "flatpak".into(), "snap".into(), "brew".into()],
+            enabled_sources: vec!["apt".into(), "flatpak".into(), "snap".into(), "brew".into(), "hpm".into()],
+            snap_default_channel: default_snap_channel(),
             ratings_enabled: true,
             default_section: "discover".into(),
         }
@@ -188,26 +297,28 @@ fn reset_job(app: &tauri::AppHandle) {
 
 // ─── Discover result cache ────────────────────────────────────────────────────
 //
-// Every category click or search keystroke used to re-run 1-2 rounds of
-// apt/flatpak/snap/brew subprocess calls from scratch, even for a category
-// the person just looked at 5 seconds ago. A short-TTL in-memory cache
-// makes flipping back to a recently-viewed category or re-typing a recent
-// search near-instant, without risking showing very stale data (entries
-// expire after CACHE_TTL regardless).
+// Every category click or search keystroke used to re-run a full round of
+// apt/flatpak/snap/brew/hpm/nix/appimage subprocess calls from scratch,
+// even for a category the person just looked at 5 seconds ago. A
+// short-TTL in-memory cache makes flipping back to a recently-viewed
+// category or re-typing a recent search near-instant, without risking
+// showing very stale data (entries expire after CACHE_TTL regardless).
+// See `SourceCacheState` below for the finer-grained, per-source layer
+// underneath this one.
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Default)]
 pub struct DiscoverCacheState {
-    pub entries: AsyncMutex<std::collections::HashMap<String, (std::time::Instant, Vec<DiscoverResult>)>>,
+    pub entries: AsyncMutex<std::collections::HashMap<String, (std::time::Instant, DiscoverResponse)>>,
 }
 
-async fn cache_get(app: &tauri::AppHandle, key: &str) -> Option<Vec<DiscoverResult>> {
+async fn cache_get(app: &tauri::AppHandle, key: &str) -> Option<DiscoverResponse> {
     let state = app.state::<DiscoverCacheState>();
     let map = state.entries.lock().await;
     map.get(key).and_then(|(t, v)| if t.elapsed() < CACHE_TTL { Some(v.clone()) } else { None })
 }
 
-async fn cache_set(app: &tauri::AppHandle, key: String, val: Vec<DiscoverResult>) {
+pub async fn cache_set(app: &tauri::AppHandle, key: String, val: DiscoverResponse) {
     let state = app.state::<DiscoverCacheState>();
     let mut map = state.entries.lock().await;
     map.insert(key, (std::time::Instant::now(), val));
@@ -217,6 +328,86 @@ async fn cache_set(app: &tauri::AppHandle, key: String, val: Vec<DiscoverResult>
         // order gives us first rather than tracking true LRU order.
         let stale: Vec<String> = map.keys().take(map.len() - 40).cloned().collect();
         for k in stale { map.remove(&k); }
+    }
+}
+
+// ─── Per-source Discover cache ────────────────────────────────────────────────
+//
+// The combined-response cache above is keyed by the *whole* enabled-sources
+// set, which is great for "flip back to a search/category I just looked
+// at" but is all-or-nothing: toggling one source on/off — or one slow/
+// erroring source, like nix bootstrapping Nix on first use, or the
+// AppImage feed being momentarily slow — misses (or poisons) the combined
+// entry for *every* source in that query, not just the one that changed.
+// Previously this meant apt/flatpak/snap/brew effectively got a "recently
+// viewed" speedup while nix (freshly opt-in, so its presence in
+// `enabled_sources` changes the combined key more often) rarely got to
+// reuse anything.
+//
+// This second, finer-grained cache stores each *individual* source's own
+// raw search result (or `SourceIssue`) — before dedupe/icon-enrichment —
+// so a change to one source's availability/enabled-state doesn't force
+// every other, already-fine source to be re-queried too. `run_all_sources`
+// consults this per source; the combined cache above still exists on top
+// of it for the common case (exact same query + exact same enabled set)
+// so that case still costs zero work, not even the per-source lookups or
+// `dedupe_and_enrich`'s icon-index scans.
+#[derive(Default)]
+pub struct SourceCacheState {
+    pub entries: AsyncMutex<std::collections::HashMap<String, (std::time::Instant, Result<Vec<DiscoverResult>, SourceIssue>)>>,
+}
+
+async fn source_cache_get(app: &tauri::AppHandle, key: &str) -> Option<Result<Vec<DiscoverResult>, SourceIssue>> {
+    let state = app.state::<SourceCacheState>();
+    let map = state.entries.lock().await;
+    map.get(key).and_then(|(t, v)| if t.elapsed() < CACHE_TTL { Some(v.clone()) } else { None })
+}
+
+async fn source_cache_set(app: &tauri::AppHandle, key: String, val: Result<Vec<DiscoverResult>, SourceIssue>) {
+    let state = app.state::<SourceCacheState>();
+    let mut map = state.entries.lock().await;
+    map.insert(key, (std::time::Instant::now(), val));
+    if map.len() > 400 {
+        // Same best-effort eviction as `cache_set`, just a higher
+        // ceiling since keys here are one per (source, query) pair
+        // rather than one per whole multi-source query.
+        let stale: Vec<String> = map.keys().take(map.len() - 250).cloned().collect();
+        for k in stale { map.remove(&k); }
+    }
+}
+
+/// Drops every cached entry — both the per-source cache above and any
+/// combined-response entry that could include this source's results —
+/// for `source`. Call this after anything that changes what a source's
+/// search actually returns *without* going through the normal
+/// install/remove flow: `hnm update` rebuilding the local nixpkgs index,
+/// and the AppImage feed's manual refresh are the two that exist today.
+/// Without this, running "Build Nix index" (or "Refresh AppImage
+/// catalog") and immediately searching again could still show the exact
+/// same stale results — or the exact same "index not built" issue — for
+/// up to `CACHE_TTL`, which would make the button feel like it did
+/// nothing.
+async fn invalidate_source_cache(app: &tauri::AppHandle, source: &str) {
+    {
+        let state = app.state::<SourceCacheState>();
+        let mut map = state.entries.lock().await;
+        let prefix = format!("{source}:");
+        map.retain(|k, _| !k.starts_with(&prefix));
+    }
+    {
+        let state = app.state::<DiscoverCacheState>();
+        let mut map = state.entries.lock().await;
+        // Key shape is "search:{query}:{sources}" / "browse:{cat}:{sources}"
+        // (see `discover_search`/`discover_browse`) — the enabled-sources
+        // list is always the last ':'-separated segment, itself
+        // comma-separated; an exact token match (not a substring check)
+        // avoids e.g. a hypothetical "unix" source matching "nix".
+        map.retain(|k, _| {
+            match k.rsplit(':').next() {
+                Some(sources) => !sources.split(',').any(|s| s == source),
+                None => true,
+            }
+        });
     }
 }
 
@@ -237,10 +428,20 @@ fn emit_log(app: &tauri::AppHandle, stream: &str, line: &str) {
 // ─── Streaming process runner ─────────────────────────────────────────────────
 
 async fn run_streaming(app: &tauri::AppHandle, argv: &[&str]) -> Result<(), String> {
+    run_streaming_env(app, argv, &[]).await
+}
+
+/// Same as [`run_streaming`], but sets the given environment variables on
+/// the child process directly (`Command::env`) instead of the old approach
+/// of prefixing `VAR=value ...` onto a `sh -c` string. Used for the Wine
+/// launchers (`WINEPREFIX`/`WINEARCH`/`WINEDEBUG`) so no shell is involved
+/// and no interpolated path/value can be mis-parsed as shell syntax.
+async fn run_streaming_env(app: &tauri::AppHandle, argv: &[&str], envs: &[(&str, &str)]) -> Result<(), String> {
     check_cancel(app)?;
 
     let mut cmd = Command::new(argv[0]);
     for a in &argv[1..] { cmd.arg(a); }
+    for (k, v) in envs { cmd.env(k, v); }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
 
     let mut child = cmd.spawn()
@@ -276,6 +477,17 @@ async fn run_streaming(app: &tauri::AppHandle, argv: &[&str]) -> Result<(), Stri
     else { Err(format!("'{}' exited {}", argv[0], status.code().unwrap_or(-1))) }
 }
 
+/// Low-level "run a real shell command" primitive. Every call site that
+/// used to build a `sh -c` string by `format!`-interpolating a package
+/// name/id/URL into it has been migrated to argv-based `run_streaming`/
+/// `priv_run` calls instead (no shell involved -> nothing to escape).
+/// `run_sh` is kept only for the rare case a genuine shell feature (a pipe,
+/// `&&`, redirection) is unavoidable. **Never** interpolate unsanitized
+/// input into `cmd` — validate with `security::validate_pkg_token` first
+/// and, if a value still must be embedded in the string, escape it with
+/// `security::sh_quote`. Currently unused; kept for future use under that
+/// contract.
+#[allow(dead_code)]
 async fn run_sh(app: &tauri::AppHandle, cmd: &str) -> Result<(), String> {
     run_streaming(app, &["sh", "-c", cmd]).await
 }
@@ -343,20 +555,47 @@ async fn ensure_flatpak(app: &tauri::AppHandle) -> Result<(), String> {
         emit_log(app, "info", "Installing Flatpak...");
         apt_install(app, &["flatpak"]).await?;
     }
-    let remote = current_settings().flatpak_remote_url;
-    let _ = run_sh(app, &format!("flatpak remote-add --if-not-exists --user flathub '{remote}' 2>/dev/null")).await;
-    let _ = run_sh(app, &format!("sudo flatpak remote-add --if-not-exists flathub '{remote}' 2>/dev/null")).await;
+    // Note: remote name/URL are operator-chosen settings (not attacker
+    // input from search results), but we still avoid the shell here —
+    // argv-based Command needs no quoting/escaping at all.
+    //
+    // Every configured remote gets added (not just a single hardcoded
+    // "flathub"), so a person who's added Flathub Beta or a mirror
+    // actually gets to search/install from it, not just have it sit
+    // unused in Settings.
+    for remote in current_settings().flatpak_remotes {
+        let name = match validate_pkg_token(&remote.name) { Ok(n) => n, Err(_) => continue };
+        let _ = run_streaming(app, &["flatpak", "remote-add", "--if-not-exists", "--user", &name, &remote.url]).await;
+        let _ = priv_run(app, &["flatpak", "remote-add", "--if-not-exists", &name, &remote.url]).await;
+    }
     Ok(())
 }
 
+/// "id" -> "id//branch" when a non-empty branch is given, matching
+/// flatpak's own ref syntax for `install`/`update` (e.g.
+/// `org.gimp.GIMP//beta`). An empty/`"stable"` branch is left as a bare
+/// id, since "stable" is what flatpak defaults to anyway and passing it
+/// explicitly isn't necessary.
+fn flatpak_ref(id: &str, branch: &str) -> String {
+    if branch.is_empty() || branch.eq_ignore_ascii_case("stable") {
+        id.to_string()
+    } else {
+        format!("{id}//{branch}")
+    }
+}
+
 async fn flatpak_install(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+    let id = validate_pkg_token(id)?;
     ensure_flatpak(app).await?;
     check_cancel(app)?;
-    emit_log(app, "info", &format!("Installing {} from Flathub...", id));
+    let settings = current_settings();
+    let remote = validate_pkg_token(&settings.flatpak_default_remote).unwrap_or_else(|_| "flathub".into());
+    let ref_arg = flatpak_ref(&id, &settings.flatpak_default_branch);
+    emit_log(app, "info", &format!("Installing {} from {}...", id, remote));
     emit_prog(app, "install", &format!("Installing {}...", id), 0.3);
-    if run_sh(app, &format!("flatpak install -y --user flathub '{id}'")).await.is_err() {
+    if run_streaming(app, &["flatpak", "install", "-y", "--user", &remote, &ref_arg]).await.is_err() {
         check_cancel(app)?;
-        run_sh(app, &format!("sudo flatpak install -y flathub '{id}'")).await?;
+        priv_run(app, &["flatpak", "install", "-y", &remote, &ref_arg]).await?;
     }
     emit_prog(app, "done", "Done!", 1.0);
     emit_log(app, "success", "Installation complete.");
@@ -364,11 +603,12 @@ async fn flatpak_install(app: &tauri::AppHandle, id: &str) -> Result<(), String>
 }
 
 async fn flatpak_uninstall(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+    let id = validate_pkg_token(id)?;
     emit_log(app, "info", &format!("Removing {}...", id));
     emit_prog(app, "uninstall", &format!("Removing {}...", id), 0.3);
-    if run_sh(app, &format!("flatpak uninstall -y --user '{id}'")).await.is_err() {
+    if run_streaming(app, &["flatpak", "uninstall", "-y", "--user", &id]).await.is_err() {
         check_cancel(app)?;
-        run_sh(app, &format!("sudo flatpak uninstall -y '{id}'")).await?;
+        priv_run(app, &["flatpak", "uninstall", "-y", &id]).await?;
     }
     emit_prog(app, "done", "Removed.", 1.0);
     emit_log(app, "success", "Removed successfully.");
@@ -378,8 +618,9 @@ async fn flatpak_uninstall(app: &tauri::AppHandle, id: &str) -> Result<(), Strin
 async fn flatpak_remote_info(id: &str) -> serde_json::Value {
     let mut info = serde_json::json!({"size":null,"version":null});
     if id.is_empty() { return info; }
+    let remote = validate_pkg_token(&current_settings().flatpak_default_remote).unwrap_or_else(|_| "flathub".into());
     let mut cmd = Command::new("flatpak");
-    cmd.args(["remote-info","--user","flathub",id]);
+    cmd.args(["remote-info","--user",&remote,id]);
     if let Some(out) = run_timeout(cmd, 6).await {
         let s = String::from_utf8_lossy(&out.stdout).to_string();
         for line in s.lines() {
@@ -392,6 +633,43 @@ async fn flatpak_remote_info(id: &str) -> serde_json::Value {
         }
     }
     info
+}
+
+/// Reads the currently-active ostree commit for an installed Flatpak app,
+/// used to record a rollback target right after install/uninstall (see
+/// `discover_install`). Tries the user installation first, then system —
+/// same fallback order everything else in this file uses for Flatpak.
+async fn flatpak_current_commit(id: &str) -> Option<String> {
+    for scope in [["info", "--user", id].as_slice(), ["info", id].as_slice()] {
+        let mut cmd = Command::new("flatpak");
+        cmd.args(scope);
+        if let Some(out) = run_timeout(cmd, 5).await {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let commit = text.lines()
+                .find_map(|l| l.trim_start().strip_prefix("Commit:"))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if commit.is_some() { return commit; }
+        }
+    }
+    None
+}
+
+/// Pins an installed Flatpak app to a specific previously-recorded commit —
+/// this is what makes Flatpak rollback possible at all, unlike apt where
+/// downgrading just means re-installing an older version string. Requires
+/// that commit to still be present in the remote's history (flatpak/ostree
+/// prune old commits over time, so a very old rollback can legitimately
+/// fail with "not found" — surfaced as-is rather than hidden).
+async fn flatpak_rollback_to_commit(app: &tauri::AppHandle, id: &str, commit: &str) -> Result<(), String> {
+    let id = validate_pkg_token(id)?;
+    let commit = validate_pkg_token(commit)?;
+    let arg = format!("--commit={commit}");
+    emit_log(app, "info", &format!("Pinning {id} to commit {}...", &commit[..commit.len().min(12)]));
+    if run_streaming(app, &["flatpak", "update", "-y", "--user", &arg, &id]).await.is_err() {
+        priv_run(app, &["flatpak", "update", "-y", &arg, &id]).await?;
+    }
+    Ok(())
 }
 
 // ─── Wine ─────────────────────────────────────────────────────────────────────
@@ -485,9 +763,20 @@ async fn ensure_nonfree(app: &tauri::AppHandle) -> Result<(), String> {
         .unwrap_or_else(|| "trixie".into());
     let mirror = current_settings().apt_mirror;
     let host = if mirror.trim().is_empty() { "deb.debian.org".to_string() } else { mirror };
-    let line = format!("deb http://{host}/debian {cn} main contrib non-free non-free-firmware");
+    let line = format!("deb http://{host}/debian {cn} main contrib non-free non-free-firmware\n");
     emit_log(app, "info", &format!("Adding non-free repositories for '{cn}'..."));
-    run_sh(app, &format!("echo '{line}' | sudo tee /etc/apt/sources.list.d/hackeros-nonfree.list > /dev/null")).await?;
+    // Write the sources-list line to a normal, unprivileged temp file, then
+    // use `install` (argv-based, no shell) to place it with root
+    // ownership/permissions. This avoids the `echo ... | sudo tee ...`
+    // shell pipe the previous version used, which required interpolating
+    // untrusted-ish values (mirror host / codename) directly into a
+    // `sh -c` string.
+    let tmp_path = std::env::temp_dir().join(format!("hackeros-nonfree-{}.list", std::process::id()));
+    std::fs::write(&tmp_path, &line).map_err(|e| format!("Failed writing temp sources file: {e}"))?;
+    let tmp_str = tmp_path.to_string_lossy().to_string();
+    let result = priv_run(app, &["install", "-m", "0644", &tmp_str, "/etc/apt/sources.list.d/hackeros-nonfree.list"]).await;
+    let _ = std::fs::remove_file(&tmp_path);
+    result?;
     priv_run(app, &["apt-get", "update", "-qq"]).await?;
     Ok(())
 }
@@ -512,8 +801,8 @@ async fn ensure_kali(app: &tauri::AppHandle) -> Result<(), String> {
     if kali_exists().await { return Ok(()); }
     emit_log(app, "info", "Creating Kali Linux container (first run ~5 min)...");
     emit_prog(app, "install", "Creating Kali container...", 0.15);
-    run_sh(app, "distrobox create --image kalilinux/kali-rolling --name kali-pentest --yes").await?;
-    let _ = run_sh(app, "distrobox enter kali-pentest -- sudo apt-get update -qq").await;
+    run_streaming(app, &["distrobox", "create", "--image", "kalilinux/kali-rolling", "--name", "kali-pentest", "--yes"]).await?;
+    let _ = run_streaming(app, &["distrobox", "enter", "kali-pentest", "--", "sudo", "apt-get", "update", "-qq"]).await;
     Ok(())
 }
 
@@ -529,6 +818,16 @@ async fn ensure_kali(app: &tauri::AppHandle) -> Result<(), String> {
 // this for anything security-critical — Debian's archive contents shift
 // between releases, and a few of these are educated guesses rather than
 // verified facts (this environment has no network access to check live).
+// Package-name/repo-availability specifics below (which of these live in
+// plain Debian main vs. only in Kali's repos) were classified from general
+// packaging knowledge, not verified against a live apt/Kali mirror from
+// this offline sandbox — same caveat as the AppImageHub feed schema
+// elsewhere in this file. Where in doubt, a tool was classified `false`
+// (Kali container) rather than `true`: a wrongly-`false` tool just means
+// one extra container round-trip the first time it's installed, while a
+// wrongly-`true` tool fails outright with "unable to locate package" on
+// plain Debian. Spot-check before shipping if exact accuracy matters more
+// than that fallback behavior.
 const PENTEST_CATALOG: &[(&str, bool)] = &[
     // ── Network / recon ──
     ("nmap",          true),
@@ -546,6 +845,14 @@ const PENTEST_CATALOG: &[(&str, bool)] = &[
     ("tshark",        true),
     ("tcpflow",       true),
     ("scapy",         true),
+    ("fping",         true),
+    ("zmap",          true),
+    ("unicornscan",   false),
+    ("dnsenum",       false),
+    ("fierce",        false),
+    ("p0f",           true),
+    ("dmitry",        false),
+    ("nbtscan",       true),
     // ── Web application testing ──
     ("burpsuite",     false),
     ("zaproxy",       true),
@@ -569,6 +876,11 @@ const PENTEST_CATALOG: &[(&str, bool)] = &[
     ("droopescan",    false),
     ("sslyze",        true),
     ("testssl.sh",    true),
+    ("wfuzz",         false),
+    ("wapiti",        true),
+    ("skipfish",      false),
+    ("xsstrike",      false),
+    ("dalfox",        false),
     // ── Password / credential attacks ──
     ("john",          true),
     ("hydra",         true),
@@ -579,6 +891,11 @@ const PENTEST_CATALOG: &[(&str, bool)] = &[
     ("patator",       true),
     ("ncrack",        true),
     ("hashid",        true),
+    ("ophcrack",      true),
+    ("fcrackzip",     true),
+    ("pdfcrack",      true),
+    ("rarcrack",      true),
+    ("bruteforce-luks", true),
     // ── Wireless ──
     ("aircrack-ng",   true),
     ("kismet",        true),
@@ -588,6 +905,9 @@ const PENTEST_CATALOG: &[(&str, bool)] = &[
     ("pixiewps",      true),
     ("hcxdumptool",   true),
     ("hcxtools",      true),
+    ("bully",         false),
+    ("mdk4",          false),
+    ("fern-wifi-cracker", false),
     // ── MITM / network attacks ──
     ("bettercap",     false),
     ("responder",     false),
@@ -598,6 +918,8 @@ const PENTEST_CATALOG: &[(&str, bool)] = &[
     ("dnschef",       false),
     ("yersinia",      true),
     ("macchanger",    true),
+    ("tcpreplay",     true),
+    ("netsniff-ng",   true),
     // ── Exploitation / Windows / AD ──
     ("metasploit",    false),
     ("impacket",      true),
@@ -605,6 +927,9 @@ const PENTEST_CATALOG: &[(&str, bool)] = &[
     ("evil-winrm",    false),
     ("bloodhound",    false),
     ("enum4linux",    true),
+    ("smbclient",     true),
+    ("ldap-utils",    true),
+    ("smbmap",        false),
     // ── OSINT ──
     ("theharvester",  true),
     ("maltego",       false),
@@ -615,14 +940,20 @@ const PENTEST_CATALOG: &[(&str, bool)] = &[
     ("sherlock",      false),
     ("spiderfoot",    false),
     ("exiftool",      true),
+    ("whois",         true),
+    ("gitleaks",      false),
+    ("h8mail",        false),
     // ── Tunneling / proxy ──
     ("proxychains",   true),
     ("tor",           true),
     ("chisel",        false),
     ("stunnel",       true),
+    ("sshuttle",      true),
+    ("iodine",        true),
     // ── Vulnerability scanning ──
     ("sslscan",       true),
     ("openvas",       false),
+    ("trivy",         false),
     // ── Forensics / reverse engineering / malware ──
     ("volatility",    true),
     ("autopsy",       true),
@@ -638,6 +969,11 @@ const PENTEST_CATALOG: &[(&str, bool)] = &[
     ("testdisk",      true),
     ("photorec",      true),
     ("sleuthkit",     true),
+    ("bulk-extractor", true),
+    ("hexedit",       true),
+    ("upx",           true),
+    ("apktool",       false),
+    ("jadx",          false),
     // ── System hardening / auditing ──
     ("lynis",         true),
     ("rkhunter",      true),
@@ -655,6 +991,7 @@ const APT_NAME_OVERRIDES: &[(&str, &str)] = &[
     ("scapy",    "python3-scapy"),
     ("stunnel",  "stunnel4"),
     ("photorec", "testdisk"),
+    ("upx",      "upx-ucl"),
 ];
 
 fn apt_pkg_name(tool: &str) -> String {
@@ -775,6 +1112,7 @@ async fn check_all_installed() -> Vec<InstalledState> {
 
 #[tauri::command]
 async fn install_package(app: tauri::AppHandle, name: String, category: String) -> Result<String, String> {
+    let name = validate_pkg_token(&name)?;
     reset_job(&app);
     emit_log(&app, "info", &format!("Starting installation of {}...", name));
     let result = match category.as_str() {
@@ -784,6 +1122,31 @@ async fn install_package(app: tauri::AppHandle, name: String, category: String) 
         _ => Err(format!("Unknown category: {category}")),
     };
     reset_job(&app);
+    let pentest_apt_backed = category == "pentest_tools" && in_debian(&name);
+    let driver_pkg_list: Option<Vec<&str>> = if category == "drivers" { driver_pkgs(&name).ok().map(|p| p.to_vec()) } else { None };
+
+    if let Some(pkgs) = &driver_pkg_list {
+        // Drivers install several apt packages at once (e.g. "NVIDIA Driver"
+        // -> nvidia-driver + firmware-misc-nonfree). Record every one of
+        // them with its resolved version so a later rollback can re-pin
+        // each package individually, instead of only ever being able to
+        // roll back single-package curated installs.
+        let versions = if result.is_ok() { history::current_apt_versions(pkgs).await } else { vec![] };
+        let versions = if versions.is_empty() { None } else { Some(versions) };
+        let _ = history::record_multi("install", "apt", &name, &name, None, versions,
+            result.is_ok(), result.as_ref().err().cloned());
+    } else {
+        let (hist_source, hist_pkg_id) = if pentest_apt_backed {
+            ("apt".to_string(), apt_pkg_name(&name))
+        } else {
+            ("curated".to_string(), name.clone())
+        };
+        let version = if result.is_ok() && pentest_apt_backed {
+            history::current_apt_version(&hist_pkg_id).await
+        } else { None };
+        let _ = history::record("install", &hist_source, &name, &hist_pkg_id, version,
+            result.is_ok(), result.as_ref().err().cloned());
+    }
     result?;
     emit_log(&app, "success", &format!("{} installed successfully.", name));
     Ok(format!("{name} installed successfully."))
@@ -793,6 +1156,7 @@ async fn install_package(app: tauri::AppHandle, name: String, category: String) 
 
 #[tauri::command]
 async fn uninstall_package(app: tauri::AppHandle, name: String, category: String) -> Result<String, String> {
+    let name = validate_pkg_token(&name)?;
     reset_job(&app);
     emit_log(&app, "info", &format!("Removing {}...", name));
     let result = match category.as_str() {
@@ -802,6 +1166,9 @@ async fn uninstall_package(app: tauri::AppHandle, name: String, category: String
         _ => Err(format!("Unknown category: {category}")),
     };
     reset_job(&app);
+    let hist_source = if (category == "pentest_tools" && in_debian(&name)) || category == "drivers" { "apt" } else { "curated" };
+    let _ = history::record("uninstall", hist_source, &name, &name, None,
+        result.is_ok(), result.as_ref().err().cloned());
     result?;
     emit_log(&app, "success", &format!("{} removed successfully.", name));
     Ok(format!("{name} removed successfully."))
@@ -868,23 +1235,25 @@ async fn install_wine_launcher(app: &tauri::AppHandle, name: &str) -> Result<(),
 
     emit_log(app, "info", &format!("Downloading {} installer...", name));
     emit_prog(app, "download", &format!("Downloading {}...", name), 0.1);
-    run_sh(app, &format!("wget -q --show-progress -O '{installer}' '{url}' 2>&1")).await?;
+    run_streaming(app, &["wget", "-q", "-O", &installer, url]).await?;
 
     check_cancel(app)?;
     verify_download(app, id, &installer).await?;
 
     emit_log(app, "info", "Initialising Wine prefix (win32)...");
     emit_prog(app, "wine", "Initialising Wine prefix...", 0.40);
-    run_sh(app, &format!(
-        "WINEPREFIX='{prefix}' WINEARCH=win32 WINEDEBUG=-all wineboot --init 2>&1"
-    )).await?;
+    run_streaming_env(
+        app, &["wineboot", "--init"],
+        &[("WINEPREFIX", &prefix), ("WINEARCH", "win32"), ("WINEDEBUG", "-all")],
+    ).await?;
 
     check_cancel(app)?;
     emit_log(app, "info", &format!("Running {} installer via Wine...", name));
     emit_prog(app, "wine", &format!("Installing {}...", name), 0.65);
-    run_sh(app, &format!(
-        "WINEPREFIX='{prefix}' WINEARCH=win32 WINEDEBUG=-all wine '{installer}' /S 2>&1"
-    )).await?;
+    run_streaming_env(
+        app, &["wine", &installer, "/S"],
+        &[("WINEPREFIX", &prefix), ("WINEARCH", "win32"), ("WINEDEBUG", "-all")],
+    ).await?;
 
     let ddir     = format!("{home}/.local/share/applications");
     std::fs::create_dir_all(&ddir).ok();
@@ -911,6 +1280,8 @@ async fn uninstall_wine_launcher(app: &tauri::AppHandle, name: &str) -> Result<(
 }
 
 async fn install_pentest(app: &tauri::AppHandle, name: &str) -> Result<(), String> {
+    let name = validate_pkg_token(name)?;
+    let name = name.as_str();
     if in_debian(name) {
         let pkg = apt_pkg_name(name);
         emit_log(app, "info", &format!("Installing {} from Debian repos...", name));
@@ -923,7 +1294,7 @@ async fn install_pentest(app: &tauri::AppHandle, name: &str) -> Result<(), Strin
         check_cancel(app)?;
         emit_log(app, "info", &format!("Installing {} in Kali container...", name));
         emit_prog(app, "install", &format!("Installing {} in Kali...", name), 0.5);
-        run_sh(app, &format!("distrobox enter kali-pentest -- sudo apt-get install -y {name}")).await?;
+        run_streaming(app, &["distrobox", "enter", "kali-pentest", "--", "sudo", "apt-get", "install", "-y", name]).await?;
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
         let bin  = format!("{home}/.local/bin");
         std::fs::create_dir_all(&bin).ok();
@@ -940,6 +1311,8 @@ async fn install_pentest(app: &tauri::AppHandle, name: &str) -> Result<(), Strin
 }
 
 async fn uninstall_pentest(app: &tauri::AppHandle, name: &str) -> Result<(), String> {
+    let name = validate_pkg_token(name)?;
+    let name = name.as_str();
     if in_debian(name) {
         let pkg = apt_pkg_name(name);
         emit_log(app, "info", &format!("Removing {} (apt)...", name));
@@ -949,7 +1322,7 @@ async fn uninstall_pentest(app: &tauri::AppHandle, name: &str) -> Result<(), Str
         emit_log(app, "info", &format!("Removing {} from Kali container...", name));
         emit_prog(app, "uninstall", &format!("Removing {}...", name), 0.3);
         if kali_exists().await {
-            let _ = run_sh(app, &format!("distrobox enter kali-pentest -- sudo apt-get remove -y {name}")).await;
+            let _ = run_streaming(app, &["distrobox", "enter", "kali-pentest", "--", "sudo", "apt-get", "remove", "-y", name]).await;
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
         let _ = std::fs::remove_file(format!("{home}/.local/bin/{name}"));
@@ -1025,6 +1398,8 @@ async fn update_system(app: tauri::AppHandle) -> Result<String, String> {
     emit_prog(&app, "update", "Running system update...", 0.1);
     let result = run_streaming(&app, &[&script]).await;
     reset_job(&app);
+    let _ = history::record("update", "system", "HackerOS system update", "system", None,
+        result.is_ok(), result.as_ref().err().cloned());
     result?;
     emit_prog(&app, "done", "System updated!", 1.0);
     emit_log(&app, "success", "System updated successfully.");
@@ -1058,10 +1433,33 @@ async fn run_timeout(mut cmd: Command, secs: u64) -> Option<std::process::Output
     tokio::time::timeout(std::time::Duration::from_secs(secs), cmd.output()).await.ok()?.ok()
 }
 
-async fn search_apt(query: String) -> Vec<DiscoverResult> {
+/// Same as `run_timeout`, but keeps *why* it failed instead of collapsing
+/// timeout / missing-binary / any other spawn error into the same `None` —
+/// used by the Discover source functions so `run_all_sources` can report
+/// e.g. "Snap did not respond in time" instead of just quietly returning
+/// fewer results with no explanation.
+async fn run_timeout_reported(mut cmd: Command, secs: u64, source: &str) -> Result<std::process::Output, SourceIssue> {
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), cmd.output()).await {
+        Err(_) => Err(SourceIssue {
+            source: source.into(), kind: "timeout".into(),
+            message: format!("{source} did not respond within {secs}s."),
+        }),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Err(SourceIssue {
+            source: source.into(), kind: "unavailable".into(),
+            message: format!("{source} is not installed on this system."),
+        }),
+        Ok(Err(e)) => Err(SourceIssue {
+            source: source.into(), kind: "error".into(),
+            message: format!("{source} failed: {e}"),
+        }),
+        Ok(Ok(out)) => Ok(out),
+    }
+}
+
+async fn search_apt(query: String) -> Result<Vec<DiscoverResult>, SourceIssue> {
     let mut cmd = Command::new("apt-cache");
     cmd.args(["search", "--names-only", &query]);
-    let Some(out) = run_timeout(cmd, 4).await else { return vec![]; };
+    let out = run_timeout_reported(cmd, 4, "apt").await?;
     let items: Vec<(String,String)> = String::from_utf8_lossy(&out.stdout)
         .lines().take(14).filter_map(|l| {
             let mut p = l.splitn(2, " - ");
@@ -1070,7 +1468,7 @@ async fn search_apt(query: String) -> Vec<DiscoverResult> {
             if n.is_empty() { return None; }
             Some((n, d))
         }).collect();
-    if items.is_empty() { return vec![]; }
+    if items.is_empty() { return Ok(vec![]); }
     let names: Vec<&str> = items.iter().map(|(n,_)| n.as_str()).collect();
     let mut dpkg_cmd = Command::new("dpkg-query");
     dpkg_cmd.arg("-W").arg("-f=${Package} ${Version}\n").args(&names);
@@ -1083,17 +1481,17 @@ async fn search_apt(query: String) -> Vec<DiscoverResult> {
         let ver=p.next().unwrap_or("").trim().to_string();
         vm.insert(pkg,ver);
     }
-    items.into_iter().map(|(name,desc)| {
+    Ok(items.into_iter().map(|(name,desc)| {
         let ver = vm.get(&name).cloned().unwrap_or_default();
         DiscoverResult { name:name.clone(), version:ver, desc, source:"apt".into(), package_id:name, size:None, icon:None }
-    }).collect()
+    }).collect())
 }
 
-async fn search_flatpak(query: String) -> Vec<DiscoverResult> {
+async fn search_flatpak(query: String) -> Result<Vec<DiscoverResult>, SourceIssue> {
     let mut cmd = Command::new("flatpak");
     cmd.args(["search","--columns=name,description,application,version",&query]);
-    let Some(out) = run_timeout(cmd, 5).await else { return vec![]; };
-    String::from_utf8_lossy(&out.stdout).lines()
+    let out = run_timeout_reported(cmd, 5, "flatpak").await?;
+    Ok(String::from_utf8_lossy(&out.stdout).lines()
         .filter(|l| !l.starts_with("Name")).take(10).filter_map(|line| {
             let c: Vec<&str> = line.split('\t').collect();
             if c.len() < 3 { return None; }
@@ -1102,30 +1500,70 @@ async fn search_flatpak(query: String) -> Vec<DiscoverResult> {
             let id  =c[2].trim().to_string();
             let ver =c.get(3).map(|s|s.trim().to_string()).unwrap_or_default();
             Some(DiscoverResult { name, version:ver, desc, source:"flatpak".into(), package_id:id, size:None, icon:None })
-        }).collect()
+        }).collect())
 }
 
-async fn search_snap(query: String) -> Vec<DiscoverResult> {
+/// Installs a snap, first checking `snap info` for whether it requires
+/// classic confinement (VS Code, Android Studio, Slack, and other snaps
+/// that need broad filesystem/system access) rather than letting
+/// `snap install` fail with a raw "requires classic confinement, aborting"
+/// CLI error the person then has to go figure out. Also applies a channel/
+/// track (`--channel=`) if one's given, falling back to the configured
+/// default (`AppSettings.snap_default_channel`) — "stable" means omit the
+/// flag entirely, since that's `snap install`'s own default.
+async fn snap_install(app: &tauri::AppHandle, id: &str, channel: Option<&str>) -> Result<(), String> {
+    let id = validate_pkg_token(id)?;
+
+    let mut info_cmd = Command::new("snap");
+    info_cmd.args(["info", &id]);
+    let confinement = run_timeout(info_cmd, 5).await.and_then(|out| {
+        String::from_utf8_lossy(&out.stdout).lines()
+            .find_map(|l| l.strip_prefix("confinement:").map(|s| s.trim().to_string()))
+    });
+
+    let mut args: Vec<String> = vec!["install".into(), id.clone()];
+    if confinement.as_deref() == Some("classic") {
+        emit_log(app, "info", &format!("{id} requires classic confinement — installing with --classic."));
+        args.push("--classic".into());
+    } else if confinement.as_deref() == Some("devmode") {
+        emit_log(app, "info", &format!("{id} is only published in devmode (development snap)."));
+        args.push("--devmode".into());
+    }
+
+    let chan = channel.filter(|c| !c.is_empty()).map(|c| c.to_string())
+        .unwrap_or_else(|| current_settings().snap_default_channel);
+    if !chan.is_empty() && !chan.eq_ignore_ascii_case("stable") {
+        let chan = validate_pkg_token(&chan)?;
+        emit_log(app, "info", &format!("Installing {id} from channel {chan}..."));
+        args.push(format!("--channel={chan}"));
+    }
+
+    let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    priv_run(app, &argv).await
+}
+
+async fn search_snap(query: String) -> Result<Vec<DiscoverResult>, SourceIssue> {
     let mut cmd = Command::new("snap");
     cmd.args(["find",&query]);
     // `snap find` calls out to the Snap Store over the network — the
     // likeliest source of multi-second (or worse) latency, so it gets the
-    // most generous timeout but is still bounded.
-    let Some(out) = run_timeout(cmd, 6).await else { return vec![]; };
-    String::from_utf8_lossy(&out.stdout).lines().skip(1).take(8).filter_map(|line| {
+    // most generous timeout but is still bounded, and reported as a
+    // "timeout" issue (not silently fewer results) if it's exceeded.
+    let out = run_timeout_reported(cmd, 6, "snap").await?;
+    Ok(String::from_utf8_lossy(&out.stdout).lines().skip(1).take(8).filter_map(|line| {
         let c: Vec<&str> = line.split_whitespace().collect();
         if c.is_empty() { return None; }
         let name=c[0].to_string();
         let ver =c.get(1).map(|s|s.to_string()).unwrap_or_default();
         let desc=c.get(3..).map(|s|s.join(" ")).unwrap_or_default();
         Some(DiscoverResult { name:name.clone(), version:ver, desc, source:"snap".into(), package_id:name, size:None, icon:None })
-    }).collect()
+    }).collect())
 }
 
-async fn search_brew(query: String) -> Vec<DiscoverResult> {
+async fn search_brew(query: String) -> Result<Vec<DiscoverResult>, SourceIssue> {
     let mut cmd = Command::new("brew");
     cmd.args(["search",&query]);
-    let Some(out) = run_timeout(cmd, 6).await else { return vec![]; };
+    let out = run_timeout_reported(cmd, 6, "brew").await?;
     let mut res = vec![];
     let mut in_sec = false;
     for line in String::from_utf8_lossy(&out.stdout).lines().take(40) {
@@ -1136,18 +1574,48 @@ async fn search_brew(query: String) -> Vec<DiscoverResult> {
             source:"brew".into(), package_id:name, size:None, icon:None });
         if res.len()>=8 { break; }
     }
-    res
+    Ok(res)
 }
 
-async fn run_all_sources(query: String, settings: &AppSettings) -> Vec<DiscoverResult> {
+async fn run_all_sources(app: &tauri::AppHandle, query: String, settings: &AppSettings) -> (Vec<DiscoverResult>, Vec<SourceIssue>) {
     let want = |s: &str| settings.enabled_sources.iter().any(|x| x == s);
-    let (apt, fp, snap, brew) = tokio::join!(
-        async { if want("apt")     { search_apt(query.clone()).await }     else { vec![] } },
-        async { if want("flatpak") { search_flatpak(query.clone()).await } else { vec![] } },
-        async { if want("snap")    { search_snap(query.clone()).await }    else { vec![] } },
-        async { if want("brew")    { search_brew(query.clone()).await }    else { vec![] } },
+    let qlc = query.to_lowercase();
+
+    // See `SourceCacheState`'s doc comment: each source's own raw result is
+    // cached independently, keyed by "{source}:{query}", so one slow/
+    // erroring/newly-toggled source doesn't force every other source to be
+    // re-queried too.
+    async fn cached<Fut>(app: &tauri::AppHandle, source: &str, qlc: &str, fetch: Fut) -> Result<Vec<DiscoverResult>, SourceIssue>
+    where
+        Fut: std::future::Future<Output = Result<Vec<DiscoverResult>, SourceIssue>>,
+    {
+        let key = format!("{source}:{qlc}");
+        if let Some(cached) = source_cache_get(app, &key).await { return cached; }
+        let result = fetch.await;
+        source_cache_set(app, key, result.clone()).await;
+        result
+    }
+
+    let (apt, fp, snap, brew, hpm_res, nix_res, appimage_res) = tokio::join!(
+        async { if want("apt")      { Some(cached(app, "apt", &qlc, search_apt(query.clone())).await) }      else { None } },
+        async { if want("flatpak")  { Some(cached(app, "flatpak", &qlc, search_flatpak(query.clone())).await) }  else { None } },
+        async { if want("snap")     { Some(cached(app, "snap", &qlc, search_snap(query.clone())).await) }     else { None } },
+        async { if want("brew")     { Some(cached(app, "brew", &qlc, search_brew(query.clone())).await) }     else { None } },
+        async { if want("hpm")      { Some(cached(app, "hpm", &qlc, hpm::search(query.clone())).await) }     else { None } },
+        async { if want("nix")      { Some(cached(app, "nix", &qlc, hnm::search(query.clone())).await) }     else { None } },
+        async { if want("appimage") { Some(cached(app, "appimage", &qlc, appimage::search(query.clone())).await) } else { None } },
     );
-    apt.into_iter().chain(fp).chain(snap).chain(brew).collect()
+
+    let mut results = vec![];
+    let mut issues = vec![];
+    for outcome in [apt, fp, snap, brew, hpm_res, nix_res, appimage_res] {
+        match outcome {
+            None => {} // source not enabled — not an issue, just not queried
+            Some(Ok(r)) => results.extend(r),
+            Some(Err(issue)) => issues.push(issue),
+        }
+    }
+    (results, issues)
 }
 
 // ─── Local icon cache lookups (no network needed for these) ──────────────────
@@ -1258,13 +1726,27 @@ async fn dedupe_and_enrich(items: Vec<DiscoverResult>) -> Vec<DiscoverResult> {
 
     let mut set: JoinSet<(usize, Option<String>)> = JoinSet::new();
     for (i, r) in deduped.iter().enumerate() {
-        let path = match r.source.as_str() {
+        let source = r.source.clone();
+        let package_id = r.package_id.clone();
+        let local_path = match source.as_str() {
             "flatpak" => fp_idx.get(&r.package_id).cloned(),
             "apt"     => apt_idx.get(&r.package_id).cloned(),
             _ => None,
         };
         set.spawn(async move {
-            let icon = match path { Some(p) => b64_file(&p).await, None => None };
+            let icon = match source.as_str() {
+                // Local AppStream icon cache — no network needed.
+                "flatpak" | "apt" => match local_path { Some(p) => b64_file(&p).await, None => None },
+                // No local cache exists for snaps (see `snapcraft_icon`'s
+                // doc comment) — this is the one enrichment path in this
+                // function that hits the network, bounded by
+                // `snapcraft_icon`'s own per-request timeouts and run
+                // concurrently with everything else here via the JoinSet,
+                // same "best effort, never blocks the whole batch on one
+                // slow lookup" shape as the rest of Discover.
+                "snap" => snapcraft_icon(&package_id).await,
+                _ => None,
+            };
             (i, icon)
         });
     }
@@ -1309,7 +1791,7 @@ fn discover_categories() -> Vec<CategoryDef> {
 }
 
 #[tauri::command]
-async fn discover_browse(app: tauri::AppHandle, category_id: String) -> Vec<DiscoverResult> {
+async fn discover_browse(app: tauri::AppHandle, category_id: String) -> DiscoverResponse {
     let settings = current_settings();
     let cache_key = format!("browse:{category_id}:{}", settings.enabled_sources.join(","));
     if let Some(cached) = cache_get(&app, &cache_key).await { return cached; }
@@ -1326,29 +1808,60 @@ async fn discover_browse(app: tauri::AppHandle, category_id: String) -> Vec<Disc
     let kw0 = kw_iter.next();
     let kw1 = kw_iter.next();
     let (batch0, batch1) = tokio::join!(
-        async { match kw0 { Some(k) => run_all_sources(k, &settings).await, None => vec![] } },
-        async { match kw1 { Some(k) => run_all_sources(k, &settings).await, None => vec![] } },
+        async { match kw0 { Some(k) => run_all_sources(&app, k, &settings).await, None => (vec![], vec![]) } },
+        async { match kw1 { Some(k) => run_all_sources(&app, k, &settings).await, None => (vec![], vec![]) } },
     );
-    let mut all = batch0;
-    all.extend(batch1);
-    let result = dedupe_and_enrich(all).await;
-    cache_set(&app, cache_key, result.clone()).await;
-    result
+    let mut all = batch0.0;
+    all.extend(batch1.0);
+    // Same issue can legitimately come from both keyword batches (e.g. snap
+    // timing out on both) — de-dup by source so the frontend doesn't show
+    // "Snap did not respond" twice.
+    let mut issues = batch0.1;
+    for issue in batch1.1 {
+        if !issues.iter().any(|i: &SourceIssue| i.source == issue.source) { issues.push(issue); }
+    }
+    let results = dedupe_and_enrich(all).await;
+    let response = DiscoverResponse { results, issues };
+    cache_set(&app, cache_key, response.clone()).await;
+    response
 }
 
 #[tauri::command]
-async fn discover_search(app: tauri::AppHandle, query: String) -> Vec<DiscoverResult> {
+async fn discover_search(app: tauri::AppHandle, query: String) -> DiscoverResponse {
     let settings = current_settings();
     let cache_key = format!("search:{}:{}", query.to_lowercase(), settings.enabled_sources.join(","));
     if let Some(cached) = cache_get(&app, &cache_key).await { return cached; }
-    let all = run_all_sources(query, &settings).await;
-    let result = dedupe_and_enrich(all).await;
-    cache_set(&app, cache_key, result.clone()).await;
-    result
+    let (all, issues) = run_all_sources(&app, query, &settings).await;
+    let results = dedupe_and_enrich(all).await;
+    let response = DiscoverResponse { results, issues };
+    cache_set(&app, cache_key, response.clone()).await;
+    response
 }
 
 #[tauri::command]
-async fn discover_install(app: tauri::AppHandle, package_id: String, source: String) -> Result<String, String> {
+async fn discover_install(
+    app: tauri::AppHandle,
+    package_id: String,
+    source: String,
+    name: Option<String>,
+    // Flatpak only: which configured remote (by name) to install from.
+    // Falls back to `settings.flatpak_default_remote`.
+    remote: Option<String>,
+    // Flatpak only: branch to install, e.g. "beta". Falls back to
+    // `settings.flatpak_default_branch`.
+    branch: Option<String>,
+    // Snap only: channel/track, e.g. "latest/edge". Falls back to
+    // `settings.snap_default_channel`.
+    channel: Option<String>,
+) -> Result<String, String> {
+    let package_id = validate_pkg_token(&package_id)?;
+    // AppImage's package_id is "owner/repo" (there's no separate slug to
+    // install by) — the display name is only used for the wrapper
+    // filename / .desktop entry, so falling back to the repo part of the
+    // id keeps install working even if the frontend didn't pass one.
+    let display_name = name.unwrap_or_else(|| {
+        package_id.rsplit('/').next().unwrap_or(&package_id).to_string()
+    });
     reset_job(&app);
     emit_log(&app, "info", &format!("Installing {} via {}...", package_id, source));
     emit_prog(&app, "install", &format!("Installing {}...", package_id), 0.2);
@@ -1357,17 +1870,46 @@ async fn discover_install(app: tauri::AppHandle, package_id: String, source: Str
             "apt"     => apt_install(&app, &[package_id.as_str()]).await,
             "flatpak" => {
                 ensure_flatpak(&app).await?;
-                if run_sh(&app, &format!("flatpak install -y --user flathub '{package_id}'")).await.is_err() {
-                    run_sh(&app, &format!("sudo flatpak install -y flathub '{package_id}'")).await?;
+                let settings = current_settings();
+                let remote_name = remote.filter(|r| !r.is_empty()).unwrap_or(settings.flatpak_default_remote);
+                let remote_name = validate_pkg_token(&remote_name)?;
+                let branch_name = branch.filter(|b| !b.is_empty()).unwrap_or(settings.flatpak_default_branch);
+                let ref_arg = flatpak_ref(&package_id, &branch_name);
+                if run_streaming(&app, &["flatpak", "install", "-y", "--user", &remote_name, &ref_arg]).await.is_err() {
+                    priv_run(&app, &["flatpak", "install", "-y", &remote_name, &ref_arg]).await?;
                 }
                 Ok(())
             },
-            "snap" => priv_run(&app, &["snap","install",&package_id]).await,
-            "brew" => run_sh(&app, &format!("brew install '{package_id}'")).await,
+            "snap" => snap_install(&app, &package_id, channel.as_deref()).await,
+            "brew" => run_streaming(&app, &["brew", "install", &package_id]).await,
+            "hpm"  => hpm::install(&app, &package_id).await,
+            "nix"  => hnm::install(&app, &package_id).await,
+            "appimage" => appimage::install(&app, &package_id, &display_name).await,
             _ => Err(format!("Unknown source: {source}")),
         }
     }.await;
     reset_job(&app);
+    let (version, commit, nix_generation) = if result.is_err() {
+        (None, None, None)
+    } else {
+        match source.as_str() {
+            "apt" => (history::current_apt_version(&package_id).await, None, None),
+            "appimage" => (appimage::is_installed(&package_id).map(|i| i.version), None, None),
+            "flatpak" => (None, flatpak_current_commit(&package_id).await, None),
+            "nix" => (None, None, hnm::current_generation().await),
+            _ => (None, None, None),
+        }
+    };
+    let _ = if commit.is_some() {
+        history::record_with_commit("install", &source, &display_name, &package_id, version, commit,
+            result.is_ok(), result.as_ref().err().cloned())
+    } else if nix_generation.is_some() {
+        history::record_with_generation("install", &source, &display_name, &package_id, version, nix_generation,
+            result.is_ok(), result.as_ref().err().cloned())
+    } else {
+        history::record("install", &source, &display_name, &package_id, version,
+            result.is_ok(), result.as_ref().err().cloned())
+    };
     result?;
     emit_prog(&app, "done", "Done!", 1.0);
     emit_log(&app, "success", &format!("{package_id} installed."));
@@ -1376,6 +1918,7 @@ async fn discover_install(app: tauri::AppHandle, package_id: String, source: Str
 
 #[tauri::command]
 async fn discover_uninstall(app: tauri::AppHandle, package_id: String, source: String) -> Result<String, String> {
+    let package_id = validate_pkg_token(&package_id)?;
     reset_job(&app);
     emit_log(&app, "info", &format!("Removing {} ({})...", package_id, source));
     emit_prog(&app, "uninstall", &format!("Removing {}...", package_id), 0.2);
@@ -1383,17 +1926,28 @@ async fn discover_uninstall(app: tauri::AppHandle, package_id: String, source: S
         match source.as_str() {
             "apt"     => apt_remove(&app, &[package_id.as_str()]).await,
             "flatpak" => {
-                if run_sh(&app, &format!("flatpak uninstall -y --user '{package_id}'")).await.is_err() {
-                    run_sh(&app, &format!("sudo flatpak uninstall -y '{package_id}'")).await?;
+                if run_streaming(&app, &["flatpak", "uninstall", "-y", "--user", &package_id]).await.is_err() {
+                    priv_run(&app, &["flatpak", "uninstall", "-y", &package_id]).await?;
                 }
                 Ok(())
             },
             "snap" => priv_run(&app, &["snap","remove",&package_id]).await,
-            "brew" => run_sh(&app, &format!("brew uninstall '{package_id}'")).await,
+            "brew" => run_streaming(&app, &["brew", "uninstall", &package_id]).await,
+            "hpm"  => hpm::remove(&app, &package_id).await,
+            "nix"  => hnm::remove(&app, &package_id).await,
+            "appimage" => appimage::uninstall(&app, &package_id).await,
             _ => Err(format!("Unknown source: {source}")),
         }
     }.await;
     reset_job(&app);
+    let nix_generation = if result.is_ok() && source == "nix" { hnm::current_generation().await } else { None };
+    let _ = if nix_generation.is_some() {
+        history::record_with_generation("uninstall", &source, &package_id, &package_id, None, nix_generation,
+            result.is_ok(), result.as_ref().err().cloned())
+    } else {
+        history::record("uninstall", &source, &package_id, &package_id, None,
+            result.is_ok(), result.as_ref().err().cloned())
+    };
     result?;
     emit_prog(&app, "done", "Removed.", 1.0);
     emit_log(&app, "success", &format!("{package_id} removed."));
@@ -1410,9 +1964,13 @@ async fn get_installed_sets() -> InstalledSets {
     let mut fp_cmd  = Command::new("flatpak");    fp_cmd.args(["list", "--columns=application"]);
     let mut snap_cmd = Command::new("snap");       snap_cmd.args(["list"]);
     let mut brew_cmd = Command::new("brew");       brew_cmd.args(["list", "--formula"]);
-    let (apt_out, fp_out, snap_out, brew_out) = tokio::join!(
+    let (apt_out, fp_out, snap_out, brew_out, hpm_names, nix_names) = tokio::join!(
         run_timeout(apt_cmd, 4), run_timeout(fp_cmd, 4), run_timeout(snap_cmd, 4), run_timeout(brew_cmd, 4),
+        hpm::installed_names(), hnm::installed_names(),
     );
+    sets.hpm = hpm_names;
+    sets.nix = nix_names;
+    sets.appimage = appimage::list_installed().into_iter().map(|e| e.repo).collect();
     if let Some(out) = apt_out {
         sets.apt = String::from_utf8_lossy(&out.stdout).lines().map(|s| s.to_string()).collect();
     }
@@ -1588,6 +2146,7 @@ fn parse_snap_info(d: &mut AppDetails, text: &str) {
         if let Some(rest) = line.strip_prefix("summary:") { d.summary = rest.trim().to_string(); continue; }
         if let Some(rest) = line.strip_prefix("license:") { d.license = Some(rest.trim().to_string()); continue; }
         if let Some(rest) = line.strip_prefix("publisher:") { d.categories.push(format!("Publisher: {}", rest.trim())); continue; }
+        if let Some(rest) = line.strip_prefix("confinement:") { d.confinement = Some(rest.trim().to_string()); continue; }
         if line.starts_with("description:") { in_desc = true; continue; }
         if in_desc {
             if line.starts_with(' ') || line.starts_with('|') {
@@ -1645,6 +2204,45 @@ async fn apt_show_info(name: &str) -> serde_json::Value {
 /// `settings.ratings_enabled` so it's opt-out for anyone who doesn't want
 /// the app making outbound requests. Coverage is naturally limited to apps
 /// that have an AppStream id ODRS recognises — in practice, Flatpak apps.
+/// Snap has no local AppStream-style icon cache the way apt/flatpak do —
+/// `snap find`/`snap info`'s plain-text output never carries an icon URL
+/// at all (that's why every snap result used to fall back to the generic
+/// source-badge icon even when apt/flatpak had a real one for the same
+/// app). The actual icon lives in the Snap Store's own JSON API instead.
+///
+/// The exact shape of `api.snapcraft.io/v2/snaps/info/<name>`'s response
+/// wasn't independently verifiable from this offline sandbox, so the media
+/// lookup below walks the JSON tolerantly (find a `media` array entry with
+/// `type == "icon"`) rather than assuming an exact nested path — same
+/// defensive approach as the `appstreamcli --format=json` parsing earlier
+/// in this file. Best-effort throughout: any failure just means "no icon
+/// for this snap", never a hard error.
+async fn snapcraft_icon(name: &str) -> Option<String> {
+    if name.is_empty() { return None; }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .build().ok()?;
+    let url = format!("https://api.snapcraft.io/v2/snaps/info/{name}");
+    let resp = client.get(&url).header("Snap-Device-Series", "16").send().await.ok()?;
+    if !resp.status().is_success() { return None; }
+    let json: serde_json::Value = resp.json().await.ok()?;
+
+    let icon_url = json.get("snap")
+        .and_then(|s| s.get("media"))
+        .and_then(|m| m.as_array())
+        .and_then(|arr| arr.iter().find(|m| m.get("type").and_then(|t| t.as_str()) == Some("icon")))
+        .and_then(|m| m.get("url"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())?;
+
+    let icon_resp = client.get(&icon_url).send().await.ok()?;
+    if !icon_resp.status().is_success() { return None; }
+    let bytes = icon_resp.bytes().await.ok()?;
+    if bytes.is_empty() || bytes.len() > 1_500_000 { return None; }
+    let mime = if icon_url.ends_with(".svg") { "image/svg+xml" } else { "image/png" };
+    Some(format!("data:{mime};base64,{}", B64.encode(&bytes)))
+}
+
 async fn fetch_rating(app_id: &str) -> Option<RatingInfo> {
     if app_id.is_empty() { return None; }
     let client = reqwest::Client::builder()
@@ -1674,8 +2272,14 @@ async fn get_app_details(app: tauri::AppHandle, package_id: String, source: Stri
         id: package_id.clone(), name: display_name, source: source.clone(),
         package_id: package_id.clone(), summary: String::new(), description: String::new(),
         icon: None, screenshots: vec![], version: None, license: None, homepage: None,
-        categories: vec![], size: None, rating: None,
+        categories: vec![], size: None, rating: None, local_rating: None, confinement: None,
     };
+
+    if let Err(e) = validate_pkg_token(&package_id) {
+        d.summary = e.clone();
+        d.description = e;
+        return d;
+    }
 
     match source.as_str() {
         "flatpak" => {
@@ -1722,6 +2326,7 @@ async fn get_app_details(app: tauri::AppHandle, package_id: String, source: Stri
             if let Some(out) = run_timeout(cmd, 6).await {
                 parse_snap_info(&mut d, &String::from_utf8_lossy(&out.stdout));
             }
+            d.icon = snapcraft_icon(&package_id).await;
         }
         "brew" => {
             let mut cmd = Command::new("brew");
@@ -1730,6 +2335,47 @@ async fn get_app_details(app: tauri::AppHandle, package_id: String, source: Stri
                 if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
                     parse_brew_info(&mut d, &json);
                 }
+            }
+        }
+        "hpm" => {
+            if let Some(info) = hpm::info(&package_id).await {
+                d.version = info.version;
+                d.summary = info.summary;
+                d.description = info.description;
+                d.license = info.license;
+                d.categories = info.tags;
+                // hpm doesn't ship icons of its own; the frontend falls
+                // back to the source badge for this source, same as it
+                // already does for any apt/flatpak app with no AppStream
+                // icon indexed.
+            }
+        }
+        "nix" => {
+            if let Some(info) = hnm::info(&package_id).await {
+                d.version = info.version;
+                d.summary = info.summary;
+                d.description = info.description;
+                d.homepage = info.homepage;
+                d.license = info.license;
+                // Like hpm, nixpkgs attributes have no per-app icon of
+                // their own here — frontend falls back to the source
+                // badge, same as any apt/flatpak app with no AppStream
+                // icon indexed.
+            }
+        }
+        "appimage" => {
+            if let Some(entry) = appimage::feed_entry(&package_id).await {
+                d.summary = entry.description.chars().take(140).collect();
+                d.description = entry.description;
+                d.homepage = entry.homepage;
+                d.categories = entry.categories;
+            }
+            d.homepage = d.homepage.or_else(|| Some(format!("https://github.com/{package_id}")));
+            if let Some(installed) = appimage::is_installed(&package_id) {
+                d.version = Some(installed.version);
+                d.icon = installed.icon_path.as_deref().and_then(|p| {
+                    std::fs::read(p).ok().map(|b| format!("data:image/png;base64,{}", B64.encode(&b)))
+                });
             }
         }
         _ => {}
@@ -1745,11 +2391,238 @@ async fn get_app_details(app: tauri::AppHandle, package_id: String, source: Stri
     if current_settings().ratings_enabled && source == "flatpak" {
         d.rating = fetch_rating(&package_id).await;
     }
+    // Local rating covers every source (apt/flatpak/snap/brew), unlike the
+    // ODRS-backed `rating` field above which only exists for Flatpak.
+    d.local_rating = ratings::get_local_rating(&source, &package_id);
     d
 }
 
 #[tauri::command]
+fn submit_rating(source: String, package_id: String, stars: u8, comment: Option<String>) -> Result<RatingInfo, String> {
+    ratings::submit_rating(&source, &package_id, stars, comment)
+}
+
+#[tauri::command]
+fn get_local_rating(source: String, package_id: String) -> Option<RatingInfo> {
+    ratings::get_local_rating(&source, &package_id)
+}
+
+#[tauri::command]
+fn get_reviews(source: String, package_id: String) -> Vec<ratings::LocalReview> {
+    ratings::get_reviews(&source, &package_id)
+}
+
+#[tauri::command]
+fn get_install_history() -> Vec<history::HistoryEntry> {
+    history::get_all()
+}
+
+#[tauri::command]
+fn clear_install_history() -> Result<(), String> {
+    history::clear()
+}
+
+#[tauri::command]
+async fn rollback_history_entry(app: tauri::AppHandle, entry_id: String) -> Result<String, String> {
+    history::rollback_entry(&app, &entry_id).await
+}
+
+/// Lets the Settings UI show whether Homebrew/Linuxbrew was actually
+/// detected on this machine, rather than presenting it as an always-on
+/// source that silently errors on every search/install for anyone who
+/// doesn't have it installed (see README: "Homebrew support" for the
+/// full set of caveats around this source on Linux).
+#[tauri::command]
+async fn is_brew_available() -> bool {
+    Command::new("which").arg("brew").output().await
+        .map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Same status check as `is_brew_available`, generalized to every source —
+/// this is what used to only exist for brew (Settings could show "brew not
+/// detected" but flatpak/snap just silently returned zero Discover results
+/// with no explanation if `flatpak`/`snapd` weren't installed). One command
+/// covering all of them means Settings can show the same "not detected"
+/// treatment consistently instead of brew being a special case.
+#[tauri::command]
+async fn is_flatpak_available() -> bool {
+    Command::new("which").arg("flatpak").output().await
+        .map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[tauri::command]
+async fn is_snap_available() -> bool {
+    // `snap` the CLI can be present without `snapd` actually running (a
+    // partial/broken install) — checking the CLI binary is still the
+    // right signal here though: `snap find`/`install` fail with a clear
+    // "no snapd" error from the CLI itself in that case, whereas a
+    // missing CLI binary is what previously looked identical to "found
+    // nothing" in Discover.
+    Command::new("which").arg("snap").output().await
+        .map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Same idea as `is_brew_available`, for the HackerOS Community Repository
+/// source: lets Settings show "hpm not detected" instead of Discover
+/// silently returning zero hpm results with no explanation.
+#[tauri::command]
+async fn is_hpm_available() -> bool {
+    hpm::is_available().await
+}
+
+/// Same idea as `is_hpm_available`, for the Nix/nixpkgs source (via
+/// `hnm`): lets Settings show "hnm not detected" instead of Discover
+/// silently returning zero nix results with no explanation.
+#[tauri::command]
+async fn is_nix_available() -> bool {
+    hnm::is_available().await
+}
+
+// ─── Nix panel (see hnm.rs's module doc comment + NixView.tsx) ──────────────
+//
+// Read-only/informational commands return their result directly (no job
+// state, no log terminal — the panel just renders them). Mutating ones
+// follow the same `reset_job` → run → `reset_job` shape as
+// `discover_install`/`discover_uninstall` above, so Cancel and the shared
+// TerminalLog work on them exactly the same way.
+
+#[tauri::command]
+async fn nix_list_generations() -> Result<Vec<hnm::NixGeneration>, String> {
+    hnm::list_generations().await
+}
+
+#[tauri::command]
+async fn nix_store_size() -> String {
+    hnm::store_size().await
+}
+
+#[tauri::command]
+async fn nix_list_installed() -> Vec<hnm::NixInstalledPkg> {
+    hnm::list_installed().await
+}
+
+#[tauri::command]
+async fn nix_env_status() -> Result<String, String> {
+    hnm::env_status().await
+}
+
+#[tauri::command]
+async fn nix_doctor() -> Result<String, String> {
+    hnm::doctor().await
+}
+
+#[tauri::command]
+async fn nix_check() -> Result<String, String> {
+    hnm::check().await
+}
+
+#[tauri::command]
+async fn nix_which(package: String) -> Option<String> {
+    hnm::which(&package).await
+}
+
+#[tauri::command]
+async fn nix_rollback(app: tauri::AppHandle, generation: u32) -> Result<String, String> {
+    reset_job(&app);
+    let result = hnm::rollback(&app, generation).await;
+    reset_job(&app);
+    result
+}
+
+#[tauri::command]
+async fn nix_pin(app: tauri::AppHandle, package: String, version: Option<String>) -> Result<String, String> {
+    reset_job(&app);
+    let result = hnm::pin(&app, &package, version.as_deref()).await;
+    reset_job(&app);
+    result
+}
+
+#[tauri::command]
+async fn nix_unpin(app: tauri::AppHandle, package: String) -> Result<String, String> {
+    reset_job(&app);
+    let result = hnm::unpin(&app, &package).await;
+    reset_job(&app);
+    result
+}
+
+#[tauri::command]
+async fn nix_gc(app: tauri::AppHandle) -> Result<String, String> {
+    reset_job(&app);
+    let result = hnm::gc(&app).await;
+    reset_job(&app);
+    result
+}
+
+#[tauri::command]
+async fn nix_clean(app: tauri::AppHandle) -> Result<String, String> {
+    reset_job(&app);
+    let result = hnm::clean(&app).await;
+    reset_job(&app);
+    result
+}
+
+/// Backs both the Nix panel's own "Rebuild index" button and Settings'
+/// "Build Nix index" quick action (see `SettingsView.tsx`) — same command
+/// either way, there's no cheaper partial variant `hnm update` exposes.
+#[tauri::command]
+async fn nix_update_index(app: tauri::AppHandle) -> Result<String, String> {
+    reset_job(&app);
+    let result = hnm::update_index(&app).await;
+    reset_job(&app);
+    // The whole point of rebuilding the index is to make search results
+    // change — without this, cached "index not built" / stale nix results
+    // could stick around in Discover for up to `CACHE_TTL` even though the
+    // index is now fresh (see `invalidate_source_cache`'s doc comment).
+    if result.is_ok() { invalidate_source_cache(&app, "nix").await; }
+    result
+}
+
+#[tauri::command]
+async fn nix_env_activate(app: tauri::AppHandle) -> Result<String, String> {
+    reset_job(&app);
+    let result = hnm::env_activate(&app).await;
+    reset_job(&app);
+    result
+}
+
+#[tauri::command]
+async fn nix_env_deactivate(app: tauri::AppHandle) -> Result<String, String> {
+    reset_job(&app);
+    let result = hnm::env_deactivate(&app).await;
+    reset_job(&app);
+    result
+}
+
+/// Manual "refresh catalog" action for the AppImageHub feed, so a person
+/// isn't stuck waiting up to 24h (`FEED_TTL_SECS`) for a newly-published
+/// AppImage to show up in search after this app's local cache was last
+/// updated.
+#[tauri::command]
+async fn refresh_appimage_feed(app: tauri::AppHandle) -> Result<usize, String> {
+    let result = appimage::refresh_feed().await;
+    // Same reasoning as `nix_update_index` above: a manual feed refresh
+    // is pointless if Discover keeps serving cached pre-refresh AppImage
+    // results/issues for up to `CACHE_TTL` afterwards.
+    if result.is_ok() { invalidate_source_cache(&app, "appimage").await; }
+    result
+}
+
+#[tauri::command]
+fn get_persisted_queue() -> Vec<queue_store::PersistedJob> {
+    queue_store::load()
+}
+
+#[tauri::command]
+fn save_persisted_queue(jobs: Vec<queue_store::PersistedJob>) -> Result<(), String> {
+    queue_store::save(&jobs)
+}
+
+#[tauri::command]
 async fn get_package_info(name: String, category: String) -> serde_json::Value {
+    let name = match validate_pkg_token(&name) {
+        Ok(n) => n,
+        Err(e) => return serde_json::json!({"size": null, "version": null, "note": e}),
+    };
     match category.as_str() {
         "game_launchers" => {
             let id = launcher_flatpak_id(&name);
@@ -1776,10 +2649,23 @@ fn settings_path() -> std::path::PathBuf {
 }
 
 fn current_settings() -> AppSettings {
-    std::fs::read_to_string(settings_path())
+    let mut settings: AppSettings = std::fs::read_to_string(settings_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Migration: settings.json written before `flatpak_remotes` existed
+    // only has the old single `flatpak_remote_url` string. If that's the
+    // situation we're in (remotes list still empty after deserializing —
+    // `default_flatpak_remotes` only kicks in when the key is *absent*,
+    // and an old file never has it), fold the legacy URL into a "flathub"
+    // remote entry instead of silently discarding a custom mirror.
+    if settings.flatpak_remotes.is_empty() {
+        settings.flatpak_remotes = vec![FlatpakRemote {
+            name: "flathub".into(),
+            url: settings.flatpak_remote_url.clone(),
+        }];
+    }
+    settings
 }
 
 #[tauri::command]
@@ -1818,12 +2704,22 @@ async fn clear_cache(app: tauri::AppHandle) -> Result<String, String> {
     let _ = priv_run(&app, &["apt-get", "clean"]).await;
     emit_prog(&app, "cache", "Cleared apt cache...", 0.45);
 
-    let _ = run_sh(&app, "flatpak uninstall -y --user --unused 2>/dev/null").await;
-    let _ = run_sh(&app, "sudo flatpak uninstall -y --unused 2>/dev/null").await;
+    let _ = run_streaming(&app, &["flatpak", "uninstall", "-y", "--user", "--unused"]).await;
+    let _ = priv_run(&app, &["flatpak", "uninstall", "-y", "--unused"]).await;
     emit_prog(&app, "cache", "Cleared unused Flatpak runtimes...", 0.7);
 
+    // Native directory walk instead of a shell glob (`rm -f .../*/installer.exe`),
+    // so no shell is invoked at all for this cleanup step.
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let _ = run_sh(&app, &format!("rm -f {home}/.hackeros/launchers/*/installer.exe 2>/dev/null")).await;
+    let launchers_dir = format!("{home}/.hackeros/launchers");
+    if let Ok(entries) = std::fs::read_dir(&launchers_dir) {
+        for entry in entries.flatten() {
+            let installer = entry.path().join("installer.exe");
+            if installer.is_file() {
+                let _ = std::fs::remove_file(&installer);
+            }
+        }
+    }
     emit_prog(&app, "cache", "Cleared downloaded Wine installers...", 0.9);
 
     emit_prog(&app, "done", "Cache cleared.", 1.0);
@@ -1838,6 +2734,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(JobState::default())
         .manage(DiscoverCacheState::default())
+        .manage(SourceCacheState::default())
         .invoke_handler(tauri::generate_handler![
             install_package,
             uninstall_package,
@@ -1858,6 +2755,35 @@ pub fn run() {
             reset_settings,
             get_app_info,
             clear_cache,
+            submit_rating,
+            get_local_rating,
+            get_reviews,
+            get_install_history,
+            clear_install_history,
+            rollback_history_entry,
+            is_brew_available,
+            is_flatpak_available,
+            is_snap_available,
+            is_hpm_available,
+            is_nix_available,
+            nix_list_generations,
+            nix_store_size,
+            nix_list_installed,
+            nix_env_status,
+            nix_doctor,
+            nix_check,
+            nix_which,
+            nix_rollback,
+            nix_pin,
+            nix_unpin,
+            nix_gc,
+            nix_clean,
+            nix_update_index,
+            nix_env_activate,
+            nix_env_deactivate,
+            refresh_appimage_feed,
+            get_persisted_queue,
+            save_persisted_queue,
         ])
         .run(tauri::generate_context!())
         .expect("error running tauri application");
