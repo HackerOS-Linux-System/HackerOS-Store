@@ -1,4 +1,4 @@
-export type Category = "game_launchers" | "pentest_tools" | "drivers" | "update" | "discover" | "settings";
+export type Category = "game_launchers" | "pentest_tools" | "drivers" | "update" | "discover" | "settings" | "history" | "nix";
 export interface Package { name: string; desc: string; category: Category; icon: string; tags?: string[]; }
 
 export const GAME_LAUNCHERS: Package[] = [
@@ -33,6 +33,14 @@ export const PENTEST_TOOLS: Package[] = [
   { name:"tshark",        desc:"Terminal version of Wireshark.",                       category:"pentest_tools", icon:"Fish", tags:["packet"] },
   { name:"tcpflow",       desc:"TCP flow recorder for protocol analysis.",             category:"pentest_tools", icon:"Fish", tags:["packet"] },
   { name:"scapy",         desc:"Interactive packet manipulation and crafting.",        category:"pentest_tools", icon:"Fish", tags:["packet","python"] },
+  { name:"fping",         desc:"Send ICMP echo probes to multiple hosts in parallel.", category:"pentest_tools", icon:"Radar", tags:["network","recon"] },
+  { name:"zmap",          desc:"Fast single-packet network scanner for large scans.",  category:"pentest_tools", icon:"Radar", tags:["network","recon"] },
+  { name:"unicornscan",   desc:"Asynchronous stateless TCP/UDP port scanner.",         category:"pentest_tools", icon:"Radar", tags:["network","recon"] },
+  { name:"dnsenum",       desc:"DNS enumeration and zone transfer testing tool.",       category:"pentest_tools", icon:"Globe", tags:["network","dns"] },
+  { name:"fierce",        desc:"Domain DNS reconnaissance and zone-walker.",           category:"pentest_tools", icon:"Globe", tags:["network","dns"] },
+  { name:"p0f",           desc:"Passive OS fingerprinting from network traffic.",       category:"pentest_tools", icon:"Fish", tags:["network","recon"] },
+  { name:"dmitry",        desc:"Deepmagic information gathering tool.",                category:"pentest_tools", icon:"Telescope", tags:["network","recon"] },
+  { name:"nbtscan",       desc:"NetBIOS name scanner for local networks.",             category:"pentest_tools", icon:"Radar", tags:["network","recon"] },
   // ── Web application testing ──
   { name:"burpsuite",     desc:"Web vulnerability scanner and intercepting proxy.",    category:"pentest_tools", icon:"Bug", tags:["web","proxy"] },
   { name:"zaproxy",       desc:"OWASP ZAP web application security scanner.",         category:"pentest_tools", icon:"Bug", tags:["web"] },
@@ -56,6 +64,11 @@ export const PENTEST_TOOLS: Package[] = [
   { name:"droopescan",    desc:"Drupal/Silverstripe CMS security scanner.",           category:"pentest_tools", icon:"Search", tags:["web","cms"] },
   { name:"sslyze",        desc:"Fast and comprehensive TLS/SSL configuration scanner.",category:"pentest_tools", icon:"Lock", tags:["ssl","web"] },
   { name:"testssl.sh",    desc:"Command-line tool to test TLS/SSL of any server.",    category:"pentest_tools", icon:"Lock", tags:["ssl","web"] },
+  { name:"wfuzz",         desc:"Web application fuzzer for parameters and content.",  category:"pentest_tools", icon:"Search", tags:["web","fuzzing"] },
+  { name:"wapiti",        desc:"Black-box web vulnerability scanner.",                category:"pentest_tools", icon:"Bug", tags:["web","vuln"] },
+  { name:"skipfish",      desc:"Active web application security reconnaissance tool.", category:"pentest_tools", icon:"Search", tags:["web","recon"] },
+  { name:"xsstrike",      desc:"Advanced XSS detection and exploitation suite.",       category:"pentest_tools", icon:"Bug", tags:["web","xss"] },
+  { name:"dalfox",        desc:"Fast parameter-based XSS scanner.",                    category:"pentest_tools", icon:"Bug", tags:["web","xss"] },
   // ── Password / credential attacks ──
   { name:"john",          desc:"John the Ripper — classic password cracker.",         category:"pentest_tools", icon:"KeyRound", tags:["password","crack"] },
   { name:"hydra",         desc:"Fast network login brute-force tool.",                category:"pentest_tools", icon:"KeyRound", tags:["password","bruteforce"] },
@@ -66,6 +79,11 @@ export const PENTEST_TOOLS: Package[] = [
   { name:"patator",       desc:"Multi-purpose, modular brute-forcer.",                category:"pentest_tools", icon:"KeyRound", tags:["password","bruteforce"] },
   { name:"ncrack",        desc:"High-speed network authentication cracker.",           category:"pentest_tools", icon:"KeyRound", tags:["password","bruteforce"] },
   { name:"hashid",        desc:"Identifies hash types for cracking.",                  category:"pentest_tools", icon:"KeyRound", tags:["password"] },
+  { name:"ophcrack",      desc:"Windows password cracker using rainbow tables.",       category:"pentest_tools", icon:"KeyRound", tags:["password","crack"] },
+  { name:"fcrackzip",     desc:"Brute-force cracker for password-protected ZIP files.", category:"pentest_tools", icon:"KeyRound", tags:["password","crack"] },
+  { name:"pdfcrack",      desc:"Password recovery tool for encrypted PDF files.",      category:"pentest_tools", icon:"KeyRound", tags:["password","crack"] },
+  { name:"rarcrack",      desc:"Brute-force cracker for RAR/ZIP/7z archives.",         category:"pentest_tools", icon:"KeyRound", tags:["password","crack"] },
+  { name:"bruteforce-luks", desc:"Brute-force password recovery for LUKS volumes.",    category:"pentest_tools", icon:"KeyRound", tags:["password","crack"] },
   // ── Wireless ──
   { name:"aircrack-ng",   desc:"802.11 WEP/WPA/WPA2 security auditing suite.",       category:"pentest_tools", icon:"Wifi", tags:["wifi","wireless"] },
   { name:"kismet",        desc:"Wireless network detector, sniffer, and IDS.",        category:"pentest_tools", icon:"Wifi", tags:["wifi","wireless"] },
@@ -75,6 +93,9 @@ export const PENTEST_TOOLS: Package[] = [
   { name:"pixiewps",      desc:"WPS pixie-dust offline attack tool.",                 category:"pentest_tools", icon:"Wifi", tags:["wifi","crack"] },
   { name:"hcxdumptool",   desc:"WiFi handshake/PMKID capture tool.",                  category:"pentest_tools", icon:"Wifi", tags:["wifi","capture"] },
   { name:"hcxtools",      desc:"Convert captured WiFi handshakes for cracking.",       category:"pentest_tools", icon:"Wifi", tags:["wifi","crack"] },
+  { name:"bully",         desc:"WPS brute-force attack tool (reaver alternative).",    category:"pentest_tools", icon:"Wifi", tags:["wifi","bruteforce"] },
+  { name:"mdk4",          desc:"WiFi stress-testing and deauth attack tool.",          category:"pentest_tools", icon:"Wifi", tags:["wifi","dos"] },
+  { name:"fern-wifi-cracker", desc:"Graphical WiFi security auditing tool.",           category:"pentest_tools", icon:"Wifi", tags:["wifi","wireless"] },
   // ── MITM / network attacks ──
   { name:"bettercap",     desc:"Swiss army knife for MITM network attacks.",          category:"pentest_tools", icon:"Eye", tags:["mitm","network"] },
   { name:"responder",     desc:"LLMNR/NBT-NS/mDNS poisoner for credential capture.",  category:"pentest_tools", icon:"Eye", tags:["mitm","windows"] },
@@ -85,6 +106,8 @@ export const PENTEST_TOOLS: Package[] = [
   { name:"dnschef",       desc:"Highly configurable DNS proxy for pentesters.",       category:"pentest_tools", icon:"Globe", tags:["mitm","dns"] },
   { name:"yersinia",      desc:"Layer 2 network protocol attack framework.",           category:"pentest_tools", icon:"Zap", tags:["mitm","network"] },
   { name:"macchanger",    desc:"View/manipulate MAC addresses of network interfaces.",category:"pentest_tools", icon:"Fingerprint", tags:["network","spoofing"] },
+  { name:"tcpreplay",     desc:"Replay captured network traffic for testing.",         category:"pentest_tools", icon:"Fish", tags:["mitm","network"] },
+  { name:"netsniff-ng",   desc:"High-performance packet sniffer and traffic analyser.", category:"pentest_tools", icon:"Fish", tags:["mitm","network"] },
   // ── Exploitation / Windows / AD ──
   { name:"metasploit",    desc:"World's most used penetration testing framework.",     category:"pentest_tools", icon:"Bomb", tags:["exploit","framework"] },
   { name:"impacket",      desc:"Python classes for network protocol interaction.",     category:"pentest_tools", icon:"Binary", tags:["exploit","windows"] },
@@ -92,6 +115,9 @@ export const PENTEST_TOOLS: Package[] = [
   { name:"evil-winrm",    desc:"WinRM shell for Windows pentesting.",                 category:"pentest_tools", icon:"Skull", tags:["exploit","windows"] },
   { name:"bloodhound",    desc:"Active Directory attack path visualisation tool.",     category:"pentest_tools", icon:"Share2", tags:["ad","windows","recon"] },
   { name:"enum4linux",    desc:"Linux SMB/Samba enumeration tool.",                   category:"pentest_tools", icon:"Server", tags:["ad","smb"] },
+  { name:"smbclient",     desc:"FTP-like SMB/CIFS client for share enumeration.",     category:"pentest_tools", icon:"Server", tags:["ad","smb"] },
+  { name:"ldap-utils",    desc:"Command-line tools for querying LDAP directories.",   category:"pentest_tools", icon:"Server", tags:["ad","ldap"] },
+  { name:"smbmap",        desc:"SMB share enumeration and permission auditing tool.", category:"pentest_tools", icon:"Server", tags:["ad","smb"] },
   // ── OSINT ──
   { name:"theharvester",  desc:"OSINT: emails, subdomains, hosts, employee names.",   category:"pentest_tools", icon:"Telescope", tags:["osint","recon"] },
   { name:"maltego",       desc:"Interactive data mining and link analysis tool.",      category:"pentest_tools", icon:"Telescope", tags:["osint"] },
@@ -102,14 +128,20 @@ export const PENTEST_TOOLS: Package[] = [
   { name:"sherlock",      desc:"Hunt usernames across social networks.",              category:"pentest_tools", icon:"Telescope", tags:["osint"] },
   { name:"spiderfoot",    desc:"Automated OSINT reconnaissance framework.",           category:"pentest_tools", icon:"Telescope", tags:["osint","recon"] },
   { name:"exiftool",      desc:"Read/write/edit metadata in files and images.",       category:"pentest_tools", icon:"Image", tags:["osint","forensics"] },
+  { name:"whois",         desc:"Query domain/IP registration ownership records.",     category:"pentest_tools", icon:"Telescope", tags:["osint","dns"] },
+  { name:"gitleaks",      desc:"Scan git repos for hardcoded secrets and keys.",      category:"pentest_tools", icon:"KeyRound", tags:["osint","secrets"] },
+  { name:"h8mail",        desc:"Email OSINT and breach-data hunting tool.",           category:"pentest_tools", icon:"Mail", tags:["osint"] },
   // ── Tunneling / proxy ──
   { name:"proxychains",   desc:"Force any TCP connection through proxies.",            category:"pentest_tools", icon:"Link2", tags:["proxy","utility"] },
   { name:"tor",           desc:"The Onion Router — anonymous network tool.",           category:"pentest_tools", icon:"CircleDot", tags:["anonymity","proxy"] },
   { name:"chisel",        desc:"Fast TCP/UDP tunnel over HTTP.",                       category:"pentest_tools", icon:"Link2", tags:["proxy","tunnel"] },
   { name:"stunnel",       desc:"Universal TLS tunneling wrapper.",                     category:"pentest_tools", icon:"Lock", tags:["proxy","tunnel"] },
+  { name:"sshuttle",      desc:"Transparent VPN-like proxy over an SSH connection.",   category:"pentest_tools", icon:"Link2", tags:["proxy","tunnel"] },
+  { name:"iodine",        desc:"Tunnel IPv4 traffic through a DNS server.",           category:"pentest_tools", icon:"Link2", tags:["proxy","tunnel","dns"] },
   // ── Vulnerability scanning ──
   { name:"sslscan",       desc:"SSL/TLS configuration scanner and cipher checker.",   category:"pentest_tools", icon:"Lock", tags:["ssl","web"] },
   { name:"openvas",       desc:"Open Vulnerability Assessment System (full VA).",     category:"pentest_tools", icon:"Microscope", tags:["scanner","va"] },
+  { name:"trivy",         desc:"Vulnerability scanner for containers and filesystems.", category:"pentest_tools", icon:"Microscope", tags:["scanner","container"] },
   // ── Forensics / reverse engineering / malware ──
   { name:"volatility",    desc:"Advanced memory forensics framework.",                 category:"pentest_tools", icon:"Brain", tags:["forensics","memory"] },
   { name:"autopsy",       desc:"Graphical digital forensics platform.",               category:"pentest_tools", icon:"Microscope", tags:["forensics"] },
@@ -125,6 +157,11 @@ export const PENTEST_TOOLS: Package[] = [
   { name:"testdisk",      desc:"Partition recovery and disk repair tool.",            category:"pentest_tools", icon:"FolderOpen", tags:["forensics","recovery"] },
   { name:"photorec",      desc:"File carving and data recovery tool.",                category:"pentest_tools", icon:"FolderOpen", tags:["forensics","recovery"] },
   { name:"sleuthkit",     desc:"Library and tools for digital forensics analysis.",   category:"pentest_tools", icon:"Microscope", tags:["forensics"] },
+  { name:"bulk-extractor", desc:"Extracts emails, URLs and other artifacts from disk images.", category:"pentest_tools", icon:"FolderOpen", tags:["forensics"] },
+  { name:"hexedit",       desc:"Simple terminal-based hex editor.",                   category:"pentest_tools", icon:"Binary", tags:["forensics","reverse"] },
+  { name:"upx",           desc:"Executable packer/unpacker for binary analysis.",     category:"pentest_tools", icon:"Binary", tags:["reverse","malware"] },
+  { name:"apktool",       desc:"Reverse-engineer and rebuild Android APK files.",     category:"pentest_tools", icon:"Code", tags:["reverse","mobile"] },
+  { name:"jadx",          desc:"Dex-to-Java decompiler for Android apps.",            category:"pentest_tools", icon:"Code", tags:["reverse","mobile"] },
   // ── System hardening / auditing ──
   { name:"lynis",         desc:"Security auditing tool for Unix/Linux systems.",      category:"pentest_tools", icon:"Microscope", tags:["audit","hardening"] },
   { name:"rkhunter",      desc:"Rootkit, backdoor and exploit scanner.",              category:"pentest_tools", icon:"Bug", tags:["audit","malware"] },
