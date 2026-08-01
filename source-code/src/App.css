@@ -51,6 +51,14 @@ body{overflow:hidden}
 .view{padding:28px 32px 48px;max-width:860px}
 .view-title{font-size:1.5em;font-weight:700;letter-spacing:-.02em;margin-bottom:6px}
 .view-sub{font-size:.85em;color:var(--text2);margin-bottom:20px;line-height:1.55}
+.nix-title-icon{vertical-align:-3px;margin-right:6px;color:#7ebae4}
+.nix-unavailable .settings-hint{color:#f87171}
+.nix-stats-row{display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+.nix-stat{display:flex;align-items:center;gap:6px;font-size:.82em;color:var(--text2)}
+.nix-stat strong{color:var(--text)}
+.nix-diag-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
+.nix-diag-row .btn{margin-top:0}
+.nix-report{background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px 14px;font-size:.74em;line-height:1.5;color:var(--text2);white-space:pre-wrap;word-break:break-word;margin-top:10px;max-height:320px;overflow:auto}
 .section-heading{font-size:1em;font-weight:600;color:var(--text2);margin:28px 0 12px;letter-spacing:-.01em}
 
 /* ── Store hero ── */
@@ -201,6 +209,7 @@ body{overflow:hidden}
 .about-grid > div{display:flex;justify-content:space-between;font-size:.82em;padding:6px 0;border-bottom:1px solid var(--border)}
 .about-grid > div:last-child{border-bottom:none}
 .about-label{color:var(--text3)}
+.detail-size-unknown{font-style:italic;color:var(--text3);opacity:.8}
 
 /* ── Discover (live browse) ── */
 .discover-hero{background:linear-gradient(135deg,#16162a 0%,#0d0d1c 50%,#0a0a10 100%);border:1px solid var(--border);border-radius:var(--radius-lg);padding:34px 32px 28px;margin-bottom:22px;position:relative;overflow:hidden}
@@ -265,3 +274,73 @@ body{overflow:hidden}
 /* ── Spin ── */
 .spin{animation:spin 1s linear infinite}
 @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+
+/* ── New: offline banner ── */
+.offline-banner{display:flex;align-items:center;gap:8px;background:rgba(251,191,36,.10);border:1px solid rgba(251,191,36,.25);color:#fbbf24;border-radius:var(--radius-sm);padding:9px 16px;font-size:.8em;font-weight:600;margin:14px 24px 0}
+
+/* ── New: error boundary ── */
+.error-boundary{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;height:100%;padding:60px 40px;text-align:center;color:var(--text2)}
+.error-boundary h1{font-size:1.1em;color:var(--text)}
+.error-boundary-detail{max-width:520px;overflow-x:auto;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 14px;font-size:.72em;color:var(--text3);white-space:pre-wrap}
+
+/* ── New: focus-visible outlines (accessibility) ── */
+button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ── New: rating rows in detail modal (ODRS + local) ── */
+.rating-row{display:flex;flex-direction:column;gap:2px;margin:6px 0}
+.rating-row .about-label{margin-bottom:2px}
+
+/* ── New: review form / star picker ── */
+.review-form{margin-top:22px;padding-top:18px;border-top:1px solid var(--border)}
+.star-picker{display:flex;gap:4px;margin:8px 0}
+.star-picker-btn{background:none;border:none;padding:2px;cursor:pointer;color:var(--text3);display:flex}
+.star-picker-btn .star-filled{color:#fbbf24}
+.review-comment-input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:.82em;padding:8px 10px;outline:none;resize:vertical;margin-bottom:10px;font-family:inherit}
+.review-comment-input:focus{border-color:var(--accent)}
+.review-list{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
+.review-list-item{background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 12px;font-size:.8em;display:flex;flex-direction:column;gap:3px}
+.review-stars{color:#fbbf24;letter-spacing:1px}
+.review-comment{color:var(--text2)}
+
+/* ── New: install queue panel ── */
+.queue-panel{margin:0 8px 8px;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm)}
+.queue-panel-header{display:flex;align-items:center;gap:6px;font-size:.74em;font-weight:700;color:var(--text2);margin-bottom:6px}
+.queue-panel-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
+.queue-panel-item{display:flex;align-items:center;gap:6px;font-size:.72em;color:var(--text2)}
+.queue-panel-item--running{color:var(--accent)}
+.queue-panel-label{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.queue-panel-status{color:var(--text3);font-size:.9em}
+.queue-panel-remove{background:none;border:none;color:var(--text3);cursor:pointer;display:flex;padding:2px}
+.queue-panel-remove:hover{color:var(--text)}
+.queue-panel-note{font-size:.68em;color:var(--text3);margin:6px 0 0;line-height:1.4}
+
+/* ── New: install history view ── */
+.history-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.history-item{display:flex;align-items:flex-start;gap:10px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px 14px}
+.history-item--ok{color:#34d399}
+.history-item--fail{color:#f87171}
+.history-item-body{flex:1;color:var(--text)}
+.history-item-title{font-size:.86em;font-weight:600}
+.history-item-source{color:var(--text3);font-weight:400}
+.history-item-version{font-size:.76em;color:var(--text3)}
+.history-item-message{font-size:.76em;color:#f87171;margin-top:2px}
+.history-item-time{font-size:.7em;color:var(--text3);margin-top:2px}
+
+/* ── New: brew availability badge in Settings ── */
+.brew-status{font-size:.68em;font-weight:600;margin-left:auto;padding:1px 7px;border-radius:20px}
+.brew-status--ok{color:#34d399;background:rgba(52,211,153,.12)}
+.brew-status--missing{color:var(--text3);background:var(--bg4)}
+.source-toggle{flex-wrap:wrap}
+.source-optin-note{flex-basis:100%;margin-top:2px}
+.remote-list{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}
+.remote-row{display:flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);padding:7px 10px}
+.remote-row--add{background:transparent;border:1px dashed var(--border);padding:6px}
+.remote-row--add .settings-input{margin:0;flex:1}
+.remote-name{font-weight:600;font-size:.82em;flex:0 0 auto}
+.remote-url{font-size:.74em;color:var(--text3);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ── New: queue reorder buttons ── */
+.queue-panel-reorder{display:flex;flex-direction:column;gap:0}
+.queue-panel-reorder-btn{background:none;border:none;color:var(--text3);cursor:pointer;display:flex;padding:0;line-height:0}
+.queue-panel-reorder-btn:hover:not(:disabled){color:var(--text)}
+.queue-panel-reorder-btn:disabled{opacity:.25;cursor:default}
