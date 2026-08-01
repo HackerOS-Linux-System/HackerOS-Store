@@ -1,9 +1,15 @@
-import React from "react";
-import ReactDOM from "react-dom/client";
+import { render } from "solid-js/web";
 import App from "./App";
+import { I18nProvider } from "./hooks/useI18n";
+import { AppErrorBoundary } from "./components/AppErrorBoundary";
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
+render(
+  () => (
+    <I18nProvider initial="en">
+      <AppErrorBoundary>
+        <App />
+      </AppErrorBoundary>
+    </I18nProvider>
+  ),
+  document.getElementById("root") as HTMLElement,
 );
