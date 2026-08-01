@@ -1,10 +1,11 @@
 # HackerOS Store
 
-![HackerOS Store](https://github.com/HackerOS-Linux-System/HackerOS-Updates/blob/main/HackerOS/ICONS/HackerOS-Store.png)
+![HackerOS Store](https://github.com/HackerOS-Linux-System/HackerOS-Updates/blob/main/HackerOS/ICONS/Hacker-Unpack.png)
 
 A desktop app store for **HackerOS** (a Debian-based Linux distribution) that lets you search,
-install, and manage software from **apt, Flatpak, Snap, and Homebrew/Linuxbrew** in one place,
-plus curated sections for game launchers, penetration-testing tools, and proprietary drivers.
+install, and manage software from **apt, Flatpak, Snap, Homebrew/Linuxbrew, the HackerOS
+Community Repository (`hpm`), Nix/nixpkgs (`hnm`), and AppImage** all in one place, plus curated
+sections for game launchers, penetration-testing tools, and proprietary drivers.
 
 Built with [Tauri 2](https://tauri.app) — a [SolidJS](https://www.solidjs.com) frontend and a
 Rust backend.
@@ -13,8 +14,22 @@ Rust backend.
 
 ## Features
 
-- **Discover** — live search and category browsing across apt, Flatpak, Snap, and Homebrew,
-  with app details, screenshots, and community ratings.
+- **Discover** — live search and category browsing across apt, Flatpak, Snap, Homebrew, the
+  HackerOS Community Repository (`hpm`), Nix/nixpkgs (`hnm`), and AppImage, with app details,
+  screenshots, and community ratings. Every source can be toggled on/off in Settings; `hpm`,
+  `hnm`, and AppImage each show a "not detected" hint when the underlying tool/feed isn't
+  available instead of silently returning zero results.
+  - **Nix/nixpkgs support** is provided entirely through `hnm` (HackerOS Nix Manager,
+    `/usr/bin/hnm`) — this app never touches Nix itself or hnm's own package index directly, the
+    same way it shells out to `hpm` rather than reading its SQLite store. It's opt-in by default
+    (see `src/types.ts`'s `OPT_IN_SOURCES`) since it needs `hnm update` run once first to build
+    the local nixpkgs index, and a first install can trigger a from-scratch Nix bootstrap.
+  - Results are cached **per source** for a short TTL (120s), not just as one all-or-nothing
+    blob per query — so nix (and every other source) benefits from "flip back to a
+    recently-viewed search/category" the same way apt/Flatpak always have, even right after
+    toggling a source on/off. Running "Build Nix index" or "Refresh AppImage catalog"
+    immediately invalidates that source's cached results, so the next search reflects the
+    rebuild right away instead of waiting out the TTL.
 - **Game Launchers** — one-click install for Steam, Lutris, Heroic/Epic Games Store, Bottles,
   GOG Galaxy, Battle.net, and the EA App (the last three run through Wine, downloaded and
   configured automatically).
@@ -24,8 +39,18 @@ Rust backend.
 - **Drivers** — proprietary/non-free driver installs (e.g. NVIDIA), including adding the
   non-free apt repositories when needed.
 - **System updates** — a one-click `apt`/`nala`-based system update with a live terminal log.
+- **Nix panel** — everything `hnm` (HackerOS Nix Manager) offers beyond Discover's plain
+  search/install/remove: browsing and rolling back Nix profile generations, pinning/unpinning
+  package versions, garbage collection, cache cleaning, `hnm doctor`/`hnm check` diagnostics,
+  shell integration (`hnm env activate`/`deactivate`), and a one-click "build the local nixpkgs
+  index" action (also available as a quick action in Settings).
 - **Install History** — every install, removal, and system update is recorded locally, with
-  best-effort rollback for apt packages.
+  best-effort rollback for apt packages (single version or per-package for multi-package
+  actions like driver installs), Flatpak (pinned to the ostree commit active right after the
+  action), the HackerOS Community Repository (`hpm`, which tracks its own restore snapshot),
+  AppImage, and Nix (`hnm`) — though Nix rollback reverts the *whole* profile generation, not
+  just one package, since that's the only granularity `hnm rollback` itself offers; the panel
+  says so plainly rather than implying a narrower undo.
 - **Ratings & reviews** — star ratings for every source (not just Flatpak), plus your own
   reviews, stored on-device.
 - **Multi-language UI** — currently English and Polish; see [Adding a new language](#adding-a-new-language)
@@ -33,7 +58,32 @@ Rust backend.
 
 ## Screenshots
 
-*(Add screenshots of Discover, an app detail page, and the Pentest Tools view here.)*
+I can't generate real screenshots of a running GUI from here, but the folder and markdown
+below are ready to go — just drop PNGs in `docs/screenshots/` with these exact names and
+uncomment the `<img>` lines (or replace this whole section) to have them show up on GitHub:
+
+| Suggested shot | File | What to show |
+|---|---|---|
+| Discover | `docs/screenshots/discover.png` | Search results mixing a few different sources' badges (apt/Flatpak/hpm/nix) |
+| App detail | `docs/screenshots/app-detail.png` | An app with screenshots/description/size populated |
+| Nix panel | `docs/screenshots/nix-panel.png` | The generations list plus the installed-packages table |
+| Pentest Tools | `docs/screenshots/pentest-tools.png` | The curated tool grid with a couple already installed |
+| Settings | `docs/screenshots/settings.png` | The sources grid, including an opt-in source's hint text |
+
+```md
+<!-- once the PNGs above exist, replace this comment with: -->
+<p align="center">
+  <img src="docs/screenshots/discover.png" width="49%" />
+  <img src="docs/screenshots/app-detail.png" width="49%" />
+</p>
+<p align="center">
+  <img src="docs/screenshots/nix-panel.png" width="49%" />
+  <img src="docs/screenshots/pentest-tools.png" width="49%" />
+</p>
+```
+
+*(Until then: `npm run dev` — see below — and this section stays a checklist rather than a
+broken image link.)*
 
 ---
 
@@ -82,11 +132,14 @@ source-code/
 │  ├─ hooks/               useI18n, useSettings, useInstalledState, useOperationRunner,
 │  │                       useQueue, useToasts, useOnlineStatus
 │  └─ components/          Sidebar, DiscoverView, AppDetailModal, SettingsView,
-│                          HistoryView, PentestView, TerminalLog, etc.
+│                          HistoryView, NixView, PentestView, TerminalLog, etc.
 └─ src-tauri/              Rust backend
    └─ src/
       ├─ lib.rs            Tauri commands: install/uninstall/update, Discover search
-      │                    (apt/flatpak/snap/brew), settings, job/progress events
+      │                    (apt/flatpak/snap/brew/hpm/nix/appimage), settings, job/progress events
+      ├─ hpm.rs            HackerOS Community Repository support, via the `hpm` CLI
+      ├─ hnm.rs            Nix/nixpkgs support, via the `hnm` (HackerOS Nix Manager) CLI
+      ├─ appimage.rs       AppImageHub-backed AppImage search/install/desktop integration
       ├─ security.rs       Shell-injection defenses (see below)
       ├─ ratings.rs        Local star ratings & reviews (all sources)
       └─ history.rs        Install history log + best-effort apt rollback
