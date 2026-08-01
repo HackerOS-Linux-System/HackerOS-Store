@@ -1,6 +1,6 @@
 [package]
-name = "hackeros-store"
-version = "0.6.0"
+name = "HackerOS-Store"
+version = "0.7.0"
 description = "HackerOS Store"
 authors = ["HackerOS Team <hackeros068@gmail.com>"]
 edition = "2021"
