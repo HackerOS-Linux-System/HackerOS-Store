@@ -9,7 +9,10 @@ export type JobExecutor = (kind: QueueJob["kind"], payload: unknown) => Promise<
  * would just fire a backend call directly — fine for Flatpak/Snap which
  * don't mind concurrent operations, but genuinely unsafe for apt (dpkg
  * takes an exclusive lock, so a second concurrent `apt-get install` simply
- * errors out, or worse, contends for the lock). This hook gives the UI a
+ * errors out, or worse, contends for the lock) — and just as unsafe for
+ * hammer, apt's fallback on systems without it (its own package DB takes
+ * an equivalent exclusive lock; see `pkgbackend.rs`/hammer's
+ * `lock::system_lock()`). This hook gives the UI a
  * visible queue: every install/uninstall/update request is enqueued, and a
  * single in-memory runner drains it one at a time, in order, regardless of
  * how many were queued while another was still running.
