@@ -10,10 +10,13 @@ import { useI18n } from "../hooks/useI18n";
 const SECTIONS = ["discover", "game_launchers", "pentest_tools", "drivers", "update"];
 
 /** Sources with a "is the underlying tool actually installed" check —
- * apt is assumed present (this is a Debian-based OS) and appimage has no
- * single binary to check for (it's a feed + GitHub Releases, not a CLI),
- * so only these get the "not detected" treatment. */
+ * `apt` here really means "apt-get, or its hammer fallback" (see
+ * `is_apt_available` / `pkgbackend.rs` on the backend) since a
+ * HackerOS install can ship either one; appimage has no single binary
+ * to check for (it's a feed + GitHub Releases, not a CLI), so it's the
+ * only source that doesn't get the "not detected" treatment. */
 const STATUS_COMMANDS: Record<string, string> = {
+  apt: "is_apt_available",
   flatpak: "is_flatpak_available",
   snap: "is_snap_available",
   brew: "is_brew_available",
@@ -107,6 +110,11 @@ export function SettingsView(props: {
                     onChange={() => toggleSource(s.id)} />
                   <SourceIcon source={s.id} size={15} />
                   <span>{s.label}</span>
+                  <Show when={s.id === "apt" && props.appInfo && props.appInfo.pkg_backend !== "apt"}>
+                    <span class="brew-status brew-status--ok" title={t("settings.pkgBackendHint")}>
+                      {t("settings.pkgBackend")}: {props.appInfo?.pkg_backend}
+                    </span>
+                  </Show>
                   <Show when={status() !== null}>
                     <span class={`brew-status ${status() ? "brew-status--ok" : "brew-status--missing"}`}>
                       {status() ? t("settings.sourceDetected") : t("settings.sourceNotDetected")}
@@ -231,6 +239,9 @@ export function SettingsView(props: {
         <div class="about-grid">
           <div><span class="about-label">{t("settings.version")}</span><span>{props.appInfo?.version ?? "—"}</span></div>
           <div><span class="about-label">{t("settings.targetRelease")}</span><span>{props.appInfo?.target_release ?? "—"}</span></div>
+          <div title={t("settings.pkgBackendHint")}>
+            <span class="about-label">{t("settings.pkgBackend")}</span><span>{props.appInfo?.pkg_backend ?? "—"}</span>
+          </div>
         </div>
       </section>
     </div>
