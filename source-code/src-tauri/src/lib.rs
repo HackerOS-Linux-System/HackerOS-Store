@@ -18,6 +18,7 @@ mod queue_store;
 mod hpm;
 mod hnm;
 mod appimage;
+mod pkgbackend;
 
 use security::validate_pkg_token;
 
@@ -264,6 +265,11 @@ pub struct AppInfo {
     pub version: String,
     pub name: String,
     pub target_release: String,
+    /// Which package manager Discover's "apt" source, driver installs, and
+    /// Debian-native pentest tools actually talk to on this machine:
+    /// "apt", "hammer (normal)", or "hammer (oci)" — see `pkgbackend.rs`.
+    /// Surfaced in the UI (About/Settings) so it's never a silent swap.
+    pub pkg_backend: String,
 }
 
 // ─── Job state (used for cooperative cancellation) ────────────────────────────
@@ -534,16 +540,20 @@ async fn priv_run(app: &tauri::AppHandle, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Installs one or more Debian packages. Delegates to [`pkgbackend`],
+/// which uses real `apt-get` when it's present on the system and
+/// transparently falls back to `hammer` (in whichever of its normal/oci
+/// modes is active) otherwise — see `pkgbackend.rs` for the full
+/// rationale. Every call site below (drivers, apt-backed pentest tools,
+/// Discover's "apt" source, Wine's i386 bootstrap, ...) keeps working
+/// unmodified either way.
 async fn apt_install(app: &tauri::AppHandle, pkgs: &[&str]) -> Result<(), String> {
-    let mut args = vec!["apt-get", "install", "-y", "--no-install-recommends"];
-    args.extend_from_slice(pkgs);
-    priv_run(app, &args).await
+    pkgbackend::install(app, pkgs).await
 }
 
+/// Removes one or more Debian packages. See [`apt_install`]'s doc comment.
 async fn apt_remove(app: &tauri::AppHandle, pkgs: &[&str]) -> Result<(), String> {
-    let mut args = vec!["apt-get", "remove", "-y"];
-    args.extend_from_slice(pkgs);
-    priv_run(app, &args).await
+    pkgbackend::remove(app, pkgs).await
 }
 
 // ─── Flatpak ──────────────────────────────────────────────────────────────────
@@ -679,22 +689,25 @@ async fn ensure_wine(app: &tauri::AppHandle) -> Result<(), String> {
         .map(|o| o.status.success()).unwrap_or(false);
     if !has {
         emit_log(app, "info", "Wine not found — installing...");
-        priv_run(app, &["dpkg", "--add-architecture", "i386"]).await?;
-        priv_run(app, &["apt-get", "update", "-qq"]).await?;
+        pkgbackend::add_foreign_arch(app, "i386").await?;
+        pkgbackend::update_index(app).await?;
         apt_install(app, &["wine", "wine32", "wine64", "winetricks", "libgl1"]).await?;
         return Ok(());
     }
-    let wine32_ok = Command::new("dpkg-query")
-        .args(["-W", "-f=${Status}", "wine32"])
-        .output().await
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("install ok"))
-        .unwrap_or(false);
+    // Was: a direct `dpkg-query -W -f='${Status}' wine32` check for the
+    // exact "install ok installed" string. `pkgbackend::installed_version`
+    // is a coarser "is it installed at all" proxy (no distinction from a
+    // half-configured dpkg state), but that distinction was never actually
+    // used here beyond "installed or not" — and unlike a raw dpkg-query
+    // call, it degrades correctly to `hammer`'s own installed-package
+    // tracking on a system that doesn't have apt-get.
+    let wine32_ok = pkgbackend::installed_version("wine32").await.is_some();
     if !wine32_ok {
         emit_log(app, "info", "wine32 not found — installing...");
-        priv_run(app, &["dpkg", "--add-architecture", "i386"]).await?;
-        priv_run(app, &["apt-get", "update", "-qq"]).await?;
+        pkgbackend::add_foreign_arch(app, "i386").await?;
+        pkgbackend::update_index(app).await?;
         apt_install(app, &["wine32", "libgl1"]).await
-            .map_err(|_| "Failed to install wine32. Please run manually:\n  sudo dpkg --add-architecture i386\n  sudo apt-get update\n  sudo apt-get install wine32".to_string())?;
+            .map_err(|_| "Failed to install wine32. Please run manually:\n  sudo dpkg --add-architecture i386\n  sudo apt-get update\n  sudo apt-get install wine32\n(or, on a hammer-based system: sudo hammer dpkg-arch add i386 && sudo hammer sync && sudo hammer install wine32)".to_string())?;
     }
     Ok(())
 }
@@ -746,6 +759,13 @@ async fn verify_download(app: &tauri::AppHandle, id: &str, path: &str) -> Result
 // ─── Non-free repos ───────────────────────────────────────────────────────────
 
 async fn ensure_nonfree(app: &tauri::AppHandle) -> Result<(), String> {
+    match pkgbackend::backend().await {
+        pkgbackend::Backend::Apt => ensure_nonfree_apt(app).await,
+        pkgbackend::Backend::Hammer => ensure_nonfree_hammer(app).await,
+    }
+}
+
+async fn ensure_nonfree_apt(app: &tauri::AppHandle) -> Result<(), String> {
     let ok = Command::new("sh").arg("-c")
         .arg("grep -r non-free /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | grep -v '#' | grep -q non-free && echo yes")
         .output().await
@@ -778,6 +798,50 @@ async fn ensure_nonfree(app: &tauri::AppHandle) -> Result<(), String> {
     let _ = std::fs::remove_file(&tmp_path);
     result?;
     priv_run(app, &["apt-get", "update", "-qq"]).await?;
+    Ok(())
+}
+
+/// Hammer equivalent of [`ensure_nonfree_apt`].
+///  - normal mode: `hammer repo add <uri> <suite> <components…>` is a
+///    documented drop-in for an apt `deb` line (it even accepts the raw
+///    apt-style "deb <uri> <suite> <comps>" string), so this adds the
+///    same `contrib non-free non-free-firmware` components against
+///    `/etc/hammer/sources-list.hk` and re-syncs.
+///  - oci mode: package sources for an OSTree base image are baked in at
+///    build/deploy time from the *image's* `/etc/apt/sources.list(.d)`,
+///    not something this Store can add live at runtime the way a normal
+///    apt/hammer sources file can be. Logs an explanation and leaves the
+///    index alone rather than silently pretending it worked.
+async fn ensure_nonfree_hammer(app: &tauri::AppHandle) -> Result<(), String> {
+    if matches!(pkgbackend::hammer_mode().await, pkgbackend::HammerMode::Oci) {
+        emit_log(
+            app,
+            "info",
+            "hammer oci mode: non-free components come from the base image's own build-time \
+             sources, not something the Store can add live — skipping.",
+        );
+        return Ok(());
+    }
+    let Some(bin) = pkgbackend::hammer_bin_pub().await else {
+        return Err("hammer is not installed on this system.".to_string());
+    };
+    let already = Command::new(&bin)
+        .args(["repo", "list"])
+        .output().await
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("non-free"))
+        .unwrap_or(false);
+    if already { return Ok(()); }
+    let cn = Command::new("lsb_release").arg("-sc").output().await.ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "trixie".into());
+    let mirror = current_settings().apt_mirror;
+    let host = if mirror.trim().is_empty() { "deb.debian.org".to_string() } else { mirror };
+    let uri = format!("http://{host}/debian");
+    emit_log(app, "info", &format!("Adding non-free repositories for '{cn}' via hammer..."));
+    priv_run(app, &[bin.as_str(), "repo", "add", uri.as_str(), cn.as_str(), "main", "contrib", "non-free", "non-free-firmware"]).await?;
+    pkgbackend::update_index(app).await?;
     Ok(())
 }
 
@@ -1039,19 +1103,9 @@ async fn check_all_installed() -> Vec<InstalledState> {
         out.push(InstalledState { key: key.to_string(), installed, version });
     }
 
-    // apt/dpkg: one call for all
-    let dpkg_text = Command::new("dpkg-query")
-        .args(["-W", "-f=${Package} ${Version}\n"])
-        .output().await
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    let mut apt: std::collections::HashMap<String,String> = std::collections::HashMap::new();
-    for line in dpkg_text.lines() {
-        let mut p = line.splitn(2, ' ');
-        let pkg = p.next().unwrap_or("").to_string();
-        let ver = p.next().unwrap_or("").trim().to_string();
-        apt.insert(pkg, ver);
-    }
+    // apt/dpkg (or hammer, if that's what this system uses — see
+    // `pkgbackend.rs`): one bulk lookup for all installed packages.
+    let apt = pkgbackend::installed_map().await;
 
     // Pentest tools that are apt/Debian-native: check via dpkg (fast, always run).
     for name in pentest_tool_names() {
@@ -1413,11 +1467,7 @@ async fn update_system(app: tauri::AppHandle) -> Result<String, String> {
 /// honour the "check for updates on startup" setting.
 #[tauri::command]
 async fn check_updates_available() -> u32 {
-    if let Ok(out) = Command::new("sh").arg("-c")
-        .arg("apt list --upgradable 2>/dev/null | grep -c upgradable")
-        .output().await {
-        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
-    } else { 0 }
+    pkgbackend::upgradable_count().await
 }
 
 // ─── Discover: source search helpers ──────────────────────────────────────────
@@ -1456,35 +1506,11 @@ async fn run_timeout_reported(mut cmd: Command, secs: u64, source: &str) -> Resu
     }
 }
 
+/// Discover "apt" source search. Delegates to [`pkgbackend::search`],
+/// which runs `apt-cache search` when real APT is present and falls back
+/// to `hammer search`/`hammer oci search` otherwise — see `pkgbackend.rs`.
 async fn search_apt(query: String) -> Result<Vec<DiscoverResult>, SourceIssue> {
-    let mut cmd = Command::new("apt-cache");
-    cmd.args(["search", "--names-only", &query]);
-    let out = run_timeout_reported(cmd, 4, "apt").await?;
-    let items: Vec<(String,String)> = String::from_utf8_lossy(&out.stdout)
-        .lines().take(14).filter_map(|l| {
-            let mut p = l.splitn(2, " - ");
-            let n = p.next()?.trim().to_string();
-            let d = p.next().unwrap_or("").trim().to_string();
-            if n.is_empty() { return None; }
-            Some((n, d))
-        }).collect();
-    if items.is_empty() { return Ok(vec![]); }
-    let names: Vec<&str> = items.iter().map(|(n,_)| n.as_str()).collect();
-    let mut dpkg_cmd = Command::new("dpkg-query");
-    dpkg_cmd.arg("-W").arg("-f=${Package} ${Version}\n").args(&names);
-    let dpkg = run_timeout(dpkg_cmd, 3).await
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
-    let mut vm: std::collections::HashMap<String,String> = std::collections::HashMap::new();
-    for line in dpkg.lines() {
-        let mut p = line.splitn(2,' ');
-        let pkg=p.next().unwrap_or("").to_string();
-        let ver=p.next().unwrap_or("").trim().to_string();
-        vm.insert(pkg,ver);
-    }
-    Ok(items.into_iter().map(|(name,desc)| {
-        let ver = vm.get(&name).cloned().unwrap_or_default();
-        DiscoverResult { name:name.clone(), version:ver, desc, source:"apt".into(), package_id:name, size:None, icon:None }
-    }).collect())
+    pkgbackend::search(query).await
 }
 
 async fn search_flatpak(query: String) -> Result<Vec<DiscoverResult>, SourceIssue> {
@@ -1960,20 +1986,21 @@ async fn get_installed_sets() -> InstalledSets {
     // each bounded by a timeout, since this fires on every Discover mount
     // and after every install/uninstall action.
     let mut sets = InstalledSets::default();
-    let mut apt_cmd = Command::new("dpkg-query"); apt_cmd.args(["-W", "-f=${Package}\n"]);
     let mut fp_cmd  = Command::new("flatpak");    fp_cmd.args(["list", "--columns=application"]);
     let mut snap_cmd = Command::new("snap");       snap_cmd.args(["list"]);
     let mut brew_cmd = Command::new("brew");       brew_cmd.args(["list", "--formula"]);
-    let (apt_out, fp_out, snap_out, brew_out, hpm_names, nix_names) = tokio::join!(
-        run_timeout(apt_cmd, 4), run_timeout(fp_cmd, 4), run_timeout(snap_cmd, 4), run_timeout(brew_cmd, 4),
+    // `pkgbackend::installed_names` covers both real apt (dpkg-query) and,
+    // when that's absent, hammer (`hammer list --installed` /
+    // `hammer oci list`) — see pkgbackend.rs.
+    let (apt_names, fp_out, snap_out, brew_out, hpm_names, nix_names) = tokio::join!(
+        pkgbackend::installed_names(),
+        run_timeout(fp_cmd, 4), run_timeout(snap_cmd, 4), run_timeout(brew_cmd, 4),
         hpm::installed_names(), hnm::installed_names(),
     );
     sets.hpm = hpm_names;
     sets.nix = nix_names;
     sets.appimage = appimage::list_installed().into_iter().map(|e| e.repo).collect();
-    if let Some(out) = apt_out {
-        sets.apt = String::from_utf8_lossy(&out.stdout).lines().map(|s| s.to_string()).collect();
-    }
+    sets.apt = apt_names;
     if let Some(out) = fp_out {
         sets.flatpak = String::from_utf8_lossy(&out.stdout).lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     }
@@ -2177,24 +2204,10 @@ fn parse_brew_info(d: &mut AppDetails, json: &serde_json::Value) {
     }
 }
 
+/// Delegates to [`pkgbackend::show_info`] — `apt-cache show` when real
+/// APT is present, `hammer info --json` / `hammer oci search` otherwise.
 async fn apt_show_info(name: &str) -> serde_json::Value {
-    let mut info = serde_json::json!({"size":null,"version":null});
-    let mut cmd = Command::new("apt-cache");
-    cmd.args(["show","--no-all-versions",name]);
-    if let Some(out) = run_timeout(cmd, 4).await {
-        let s = String::from_utf8_lossy(&out.stdout).to_string();
-        for line in s.lines() {
-            if line.starts_with("Version:") {
-                info["version"]=serde_json::json!(line.trim_start_matches("Version:").trim());
-            }
-            if line.starts_with("Size:") || line.starts_with("Installed-Size:") {
-                let kb: u64 = line.split_whitespace().last().unwrap_or("0").parse().unwrap_or(0);
-                let sz = if kb>1024 { format!("{:.1} MB",kb as f64/1024.0) } else { format!("{} KB",kb) };
-                info["size"]=serde_json::json!(sz);
-            }
-        }
-    }
-    info
+    pkgbackend::show_info(name).await
 }
 
 /// Fetches community star ratings from the GNOME ODRS service — the same
@@ -2307,16 +2320,14 @@ async fn get_app_details(app: tauri::AppHandle, package_id: String, source: Stri
                 }
             }
             if d.summary.is_empty() {
-                let mut cmd = Command::new("apt-cache");
-                cmd.args(["show","--no-all-versions",&package_id]);
-                if let Some(out) = run_timeout(cmd, 4).await {
-                    let s = String::from_utf8_lossy(&out.stdout);
-                    for line in s.lines() {
-                        if let Some(rest) = line.strip_prefix("Description-en:").or_else(|| line.strip_prefix("Description:")) {
-                            d.summary = rest.trim().to_string();
-                            d.description = rest.trim().to_string();
-                        }
-                    }
+                // `info` already carries "description" (from apt-cache's
+                // Description[-en]: field, or hammer's own package
+                // metadata when apt-get isn't present — see
+                // `pkgbackend::show_info`), so reuse it instead of a
+                // second apt-cache/hammer call for the same package.
+                if let Some(desc) = info["description"].as_str() {
+                    d.summary = desc.trim().to_string();
+                    d.description = desc.trim().to_string();
                 }
             }
         }
@@ -2476,6 +2487,17 @@ async fn is_hpm_available() -> bool {
 #[tauri::command]
 async fn is_nix_available() -> bool {
     hnm::is_available().await
+}
+
+/// Same idea as `is_hpm_available`/`is_nix_available`, for the "apt"
+/// Discover source — `true` if either real apt-get or its hammer
+/// fallback is actually usable (see `pkgbackend.rs`), so Settings can
+/// show "not detected" in the rare case neither is present (e.g. a
+/// stripped-down dev container) instead of just assuming apt exists
+/// because "this is a Debian-based OS".
+#[tauri::command]
+async fn is_apt_available() -> bool {
+    pkgbackend::is_available().await
 }
 
 // ─── Nix panel (see hnm.rs's module doc comment + NixView.tsx) ──────────────
@@ -2688,11 +2710,12 @@ fn reset_settings() -> AppSettings {
 }
 
 #[tauri::command]
-fn get_app_info() -> AppInfo {
+async fn get_app_info() -> AppInfo {
     AppInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         name: "HackerOS Store".to_string(),
         target_release: "Debian trixie (testing) and forks".to_string(),
+        pkg_backend: pkgbackend::backend_display_label().await,
     }
 }
 
@@ -2701,8 +2724,8 @@ async fn clear_cache(app: tauri::AppHandle) -> Result<String, String> {
     emit_log(&app, "info", "Clearing package manager caches...");
     emit_prog(&app, "cache", "Clearing caches...", 0.2);
 
-    let _ = priv_run(&app, &["apt-get", "clean"]).await;
-    emit_prog(&app, "cache", "Cleared apt cache...", 0.45);
+    let _ = pkgbackend::clean(&app).await;
+    emit_prog(&app, "cache", &format!("Cleared {} cache...", pkgbackend::backend_label().await), 0.45);
 
     let _ = run_streaming(&app, &["flatpak", "uninstall", "-y", "--user", "--unused"]).await;
     let _ = priv_run(&app, &["flatpak", "uninstall", "-y", "--unused"]).await;
@@ -2766,6 +2789,7 @@ pub fn run() {
             is_snap_available,
             is_hpm_available,
             is_nix_available,
+            is_apt_available,
             nix_list_generations,
             nix_store_size,
             nix_list_installed,
