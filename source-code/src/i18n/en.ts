@@ -76,6 +76,8 @@ const en = {
   "settings.about":            "About",
   "settings.version":          "Version",
   "settings.targetRelease":    "Target release",
+  "settings.pkgBackend":       "Package manager",
+  "settings.pkgBackendHint":   "Which package manager Discover's APT source, driver installs, and Debian-native pentest tools actually talk to on this machine. Automatically falls back from apt to hammer when apt/apt-get isn't installed.",
   "settings.startupUpdates":   "Check for system updates on startup",
   "settings.sources":          "Package sources",
   "settings.sourcesHint":      "Choose which sources Discover searches and browses. Disabling a source you don't have installed avoids errors and speeds up search.",
