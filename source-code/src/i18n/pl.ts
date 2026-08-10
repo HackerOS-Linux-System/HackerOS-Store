@@ -78,6 +78,8 @@ const pl: Record<TranslationKey, string> = {
   "settings.about":            "O programie",
   "settings.version":          "Wersja",
   "settings.targetRelease":    "Docelowe wydanie",
+  "settings.pkgBackend":       "Menedżer pakietów",
+  "settings.pkgBackendHint":   "Z jakim menedżerem pakietów faktycznie rozmawia źródło APT w Discover, instalacje sterowników i natywne narzędzia pentestowe dla Debiana na tym komputerze. Automatycznie przechodzi z apt na hammer, gdy apt/apt-get nie jest zainstalowany.",
   "settings.startupUpdates":   "Sprawdzaj aktualizacje systemu przy starcie",
   "settings.sources":          "Źródła pakietów",
   "settings.sourcesHint":      "Wybierz, które źródła przeszukuje i przegląda Discover. Wyłączenie źródła, którego nie masz zainstalowanego, unika błędów i przyspiesza wyszukiwanie.",
