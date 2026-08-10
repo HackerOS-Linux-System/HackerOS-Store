@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tokio::process::Command;
 
 use crate::security::validate_pkg_token;
 
@@ -211,12 +210,13 @@ pub fn clear() -> Result<(), String> {
     save(&[])
 }
 
-/// Best-effort apt version pin used by rollback. Only ever called after
+/// Best-effort version pin used by rollback. Only ever called after
 /// `source == "apt"` and a validated package_id + version have been
-/// confirmed by the caller.
+/// confirmed by the caller. Delegates to [`crate::pkgbackend::downgrade_to`],
+/// which uses `apt-get install --allow-downgrades` when real APT is
+/// present and falls back to `hammer`'s equivalent otherwise.
 async fn apt_downgrade_to(app: &tauri::AppHandle, package_id: &str, version: &str) -> Result<(), String> {
-    let spec = format!("{package_id}={version}");
-    crate::priv_run(app, &["apt-get", "install", "-y", "--allow-downgrades", &spec]).await
+    crate::pkgbackend::downgrade_to(app, package_id, version).await
 }
 
 /// Attempts to roll a single history entry back to the version(s) it
@@ -312,32 +312,19 @@ pub async fn rollback_entry(app: &tauri::AppHandle, entry_id: &str) -> Result<St
     Ok(msg)
 }
 
-/// Best-effort lookup of the currently-installed apt/dpkg version of a
-/// package, used to populate `HistoryEntry.version` right after an
+/// Best-effort lookup of the currently-installed apt/dpkg (or hammer, on a
+/// system without real APT — see `pkgbackend.rs`) version of a package,
+/// used to populate `HistoryEntry.version` right after an
 /// install/uninstall so a later rollback has something to target.
 pub async fn current_apt_version(package_id: &str) -> Option<String> {
-    let out = Command::new("dpkg-query")
-        .args(["-W", "-f=${Version}", package_id])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if v.is_empty() { None } else { Some(v) }
+    crate::pkgbackend::installed_version(package_id).await
 }
 
 /// Same as [`current_apt_version`], but for several packages at once (used
-/// by driver installs, which touch multiple apt packages). Packages that
-/// aren't actually installed (e.g. a virtual/meta package with no direct
-/// dpkg entry) are silently omitted rather than failing the whole lookup.
+/// by driver installs, which touch multiple apt/hammer packages). Packages
+/// that aren't actually installed (e.g. a virtual/meta package with no
+/// direct dpkg entry) are silently omitted rather than failing the whole
+/// lookup.
 pub async fn current_apt_versions(package_ids: &[&str]) -> Vec<PackageVersion> {
-    let mut out = Vec::new();
-    for &pkg in package_ids {
-        if let Some(version) = current_apt_version(pkg).await {
-            out.push(PackageVersion { name: pkg.to_string(), version });
-        }
-    }
-    out
+    crate::pkgbackend::installed_versions(package_ids).await
 }
