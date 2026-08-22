@@ -1,5 +1,5 @@
 import { Show } from "solid-js";
-import { Loader2, CheckCircle, Trash2 } from "lucide-solid";
+import { Loader2, CheckCircle, Trash2, Lock } from "lucide-solid";
 import type { Package } from "../data/packages";
 import { useI18n } from "../hooks/useI18n";
 
@@ -8,6 +8,10 @@ export function InstallBtn(props: {
   version?: string; onInstall: (p: Package) => void; onUninstall: (p: Package) => void;
 }) {
   const { t } = useI18n();
+  // Defaults to removable (true) — only false for entries that explicitly
+  // opt out, currently just the HackerOS Ecosystem's Hydra (see
+  // data/packages.ts).
+  const removable = () => props.pkg.uninstallable !== false;
   return (
     <Show
       when={!props.uninstalling}
@@ -25,9 +29,18 @@ export function InstallBtn(props: {
               <CheckCircle size={13} /> {t("btn.installed")}
             </button>
             <Show when={props.version}><span class="installed-version">{props.version}</span></Show>
-            <button class="btn-uninstall" onClick={() => props.onUninstall(props.pkg)} title={t("btn.uninstall")} aria-label={`${t("btn.uninstall")} ${props.pkg.name}`}>
-              <Trash2 size={13} />
-            </button>
+            <Show
+              when={removable()}
+              fallback={
+                <span class="btn-uninstall btn-uninstall--locked" title={t("btn.cannotUninstall")} aria-label={t("btn.cannotUninstall")}>
+                  <Lock size={13} />
+                </span>
+              }
+            >
+              <button class="btn-uninstall" onClick={() => props.onUninstall(props.pkg)} title={t("btn.uninstall")} aria-label={`${t("btn.uninstall")} ${props.pkg.name}`}>
+                <Trash2 size={13} />
+              </button>
+            </Show>
           </div>
         }
       >
