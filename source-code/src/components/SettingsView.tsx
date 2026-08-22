@@ -1,13 +1,13 @@
 import { createSignal, createEffect, createMemo, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { Trash2, RefreshCw, Plus, Snowflake } from "lucide-solid";
+import { Trash2, RefreshCw, Plus, Snowflake, Download, Upload } from "lucide-solid";
 import type { AppInfo, AppSettings, FlatpakRemote } from "../types";
-import { SOURCES, OPT_IN_SOURCES, SNAP_CHANNELS } from "../types";
+import { SOURCES, OPT_IN_SOURCES, SNAP_CHANNELS, THEMES, DEV_TOOLS_DEFAULT_MODES } from "../types";
 import { LANGUAGES } from "../i18n";
 import { SourceIcon } from "../iconMap";
 import { useI18n } from "../hooks/useI18n";
 
-const SECTIONS = ["discover", "game_launchers", "pentest_tools", "drivers", "update"];
+const SECTIONS = ["discover", "game_launchers", "pentest_tools", "drivers", "hackeros_ecosystem", "dev_tools", "update"];
 
 /** Sources with a "is the underlying tool actually installed" check —
  * `apt` here really means "apt-get, or its hammer fallback" (see
@@ -30,6 +30,8 @@ export function SettingsView(props: {
   onClearCache: () => void;
   onReset: () => void;
   onBuildNixIndex: () => void;
+  onExportSnapshot: (path: string) => Promise<string | null>;
+  onImportSnapshot: (path: string) => void;
   busy: boolean;
   appInfo: AppInfo | null;
 }) {
@@ -38,6 +40,9 @@ export function SettingsView(props: {
   const [sourceStatus, setSourceStatus] = createSignal<Record<string, boolean | null>>({});
   const [newRemoteName, setNewRemoteName] = createSignal("");
   const [newRemoteUrl, setNewRemoteUrl] = createSignal("");
+  const [backupPath, setBackupPath] = createSignal("");
+  const [exportedPath, setExportedPath] = createSignal<string | null>(null);
+  const [exporting, setExporting] = createSignal(false);
 
   createEffect(() => setDraft(props.settings));
 
@@ -91,6 +96,36 @@ export function SettingsView(props: {
               <button class={`tag-pill ${draft().language === l.id ? "active" : ""}`}
                 onClick={() => setDraft(d => ({ ...d, language: l.id }))}>
                 {l.label}
+              </button>
+            )}
+          </For>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h2 class="settings-heading">{t("settings.theme")}</h2>
+        <p class="settings-hint">{t("settings.themeHint")}</p>
+        <div class="lang-pills">
+          <For each={THEMES}>
+            {th => (
+              <button class={`tag-pill ${draft().theme === th ? "active" : ""}`}
+                onClick={() => setDraft(d => ({ ...d, theme: th }))}>
+                {t(`settings.theme.${th}`)}
+              </button>
+            )}
+          </For>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h2 class="settings-heading">{t("devtools.settingsHeading")}</h2>
+        <p class="settings-hint">{t("devtools.settingsHint")}</p>
+        <div class="lang-pills">
+          <For each={DEV_TOOLS_DEFAULT_MODES}>
+            {m => (
+              <button class={`tag-pill ${draft().dev_tools_default_mode === m ? "active" : ""}`}
+                onClick={() => setDraft(d => ({ ...d, dev_tools_default_mode: m }))}>
+                {t(`devtools.mode.${m}`)}
               </button>
             )}
           </For>
@@ -232,6 +267,33 @@ export function SettingsView(props: {
         <button class="btn btn-uninstall-wide" onClick={props.onReset}>
           <RefreshCw size={14} /> {t("settings.reset")}
         </button>
+      </section>
+
+      <section class="settings-section">
+        <h2 class="settings-heading">{t("settings.backup")}</h2>
+        <p class="settings-hint">{t("settings.backupHint")}</p>
+        <label class="settings-label">{t("settings.backupPath")}</label>
+        <input class="settings-input" placeholder="~/hackeros-store-settings.json"
+          value={backupPath()} onInput={e => setBackupPath(e.currentTarget.value)} />
+        <div class="remote-row remote-row--add" style={{ "margin-top": "8px" }}>
+          <button class="btn btn-install-all" disabled={exporting()} onClick={async () => {
+            setExporting(true);
+            const written = await props.onExportSnapshot(backupPath());
+            if (written) setExportedPath(written);
+            setExporting(false);
+          }}>
+            <Download size={13} /> {t("btn.exportSettings")}
+          </button>
+          <button class="btn btn-install-all" onClick={() => {
+            if (!window.confirm(t("settings.importConfirm"))) return;
+            props.onImportSnapshot(backupPath());
+          }}>
+            <Upload size={13} /> {t("btn.importSettings")}
+          </button>
+        </div>
+        <Show when={exportedPath()}>
+          <p class="settings-hint" style={{ "margin-top": "8px" }}>{t("settings.backupSavedTo")} {exportedPath()}</p>
+        </Show>
       </section>
 
       <section class="settings-section">
