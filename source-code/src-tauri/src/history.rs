@@ -17,7 +17,8 @@ pub struct HistoryEntry {
     pub timestamp: String,
     /// "install" | "uninstall" | "update" | "rollback"
     pub action: String,
-    /// "apt" | "flatpak" | "snap" | "brew" | "curated" | "system"
+    /// "apt" | "flatpak" | "snap" | "brew" | "hpm" | "nix" | "appimage" |
+    /// "curated" | "hackeros_ecosystem" | "dev_tools_container" | "system"
     pub source: String,
     pub name: String,
     pub package_id: String,
@@ -267,6 +268,54 @@ pub async fn rollback_entry(app: &tauri::AppHandle, entry_id: &str) -> Result<St
                 let short = &commit[..commit.len().min(12)];
                 let msg = format!("Rolled {} back to commit {short}.", entry.name);
                 let _ = record_with_commit("rollback", "flatpak", &entry.name, &entry.package_id, None, Some(commit), true, Some(msg.clone()));
+                Ok(msg)
+            }
+            "hackeros_ecosystem" => {
+                // Unlike apt/flatpak/nix, there's no "previous version" to
+                // pin back to here — `hacker unpack`/`hacker pack` aren't
+                // versioned installs, they're a binary present/absent
+                // toggle. So "rollback" for this source just means "undo
+                // the recorded action": an install entry gets packed back
+                // up, an uninstall entry gets unpacked again. That reuses
+                // the same install/uninstall paths (including the Hydra
+                // one-way-install guard) rather than duplicating them.
+                let msg = match entry.action.as_str() {
+                    "install" => {
+                        crate::uninstall_hackeros_tool(app, &entry.name).await?;
+                        format!("Rolled back: packed {} back up (`hacker pack`).", entry.name)
+                    }
+                    "uninstall" => {
+                        crate::install_hackeros_tool(app, &entry.name).await?;
+                        format!("Rolled back: unpacked {} again (`hacker unpack`).", entry.name)
+                    }
+                    other => return Err(format!(
+                        "Rollback isn't supported for a recorded '{other}' HackerOS Ecosystem action."
+                    )),
+                };
+                let _ = record("rollback", "hackeros_ecosystem", &entry.name, &entry.package_id, None, true, Some(msg.clone()));
+                Ok(msg)
+            }
+            "dev_tools_container" => {
+                // Same "undo the recorded action" idea as
+                // `hackeros_ecosystem` above, for the Dev Tools section's
+                // Podman/Distrobox-container variants (the apt/"Local"
+                // variants instead flow through the ordinary "apt"
+                // version-pin rollback further down, since those really
+                // are just an apt package).
+                let msg = match entry.action.as_str() {
+                    "install" => {
+                        crate::uninstall_dev_tool(app, &entry.name).await?;
+                        format!("Rolled back: removed {} (container).", entry.name)
+                    }
+                    "uninstall" => {
+                        crate::install_dev_tool(app, &entry.name).await?;
+                        format!("Rolled back: reinstalled {} (container).", entry.name)
+                    }
+                    other => return Err(format!(
+                        "Rollback isn't supported for a recorded '{other}' Dev Tools action."
+                    )),
+                };
+                let _ = record("rollback", "dev_tools_container", &entry.name, &entry.package_id, None, true, Some(msg.clone()));
                 Ok(msg)
             }
             other => Err(format!(
