@@ -60,8 +60,19 @@ export interface AppSettings {
   snap_default_channel: string;
   ratings_enabled: boolean;
   default_section: string;
+  /** "dark" | "light" | "system" */
+  theme: string;
+  /** "ask" | "local" | "container" — default answer for DevToolsView's
+   * "how do you want this installed?" prompt. */
+  dev_tools_default_mode: string;
 }
-export interface AppInfo { version: string; name: string; target_release: string; }
+export interface AppInfo {
+  version: string; name: string; target_release: string;
+  /** Which package manager Discover's "apt" source, driver installs, and
+   * Debian-native pentest tools actually talk to on this machine:
+   * "apt", "hammer (normal)", or "hammer (oci)" — see backend `pkgbackend.rs`. */
+  pkg_backend: string;
+}
 
 export interface PackageVersion { name: string; version: string; }
 
@@ -132,6 +143,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   snap_default_channel: "stable",
   ratings_enabled: true,
   default_section: "discover",
+  theme: "dark",
+  dev_tools_default_mode: "ask",
 };
 
 export const SOURCES: { id: Source; label: string; color: string }[] = [
@@ -158,6 +171,13 @@ export const OPT_IN_SOURCES: Record<string, string> = {
  * ones that exist for virtually every snap. */
 export const SNAP_CHANNELS = ["stable", "candidate", "beta", "edge"];
 
+/** UI color theme options, offered as pills in Settings and via the
+ * quick-toggle button in the sidebar footer. "system" follows the OS/
+ * webview's `prefers-color-scheme` instead of forcing either palette.
+ * Display labels are translated (see `settings.theme.<id>` in i18n)
+ * rather than hardcoded here, unlike `LANGUAGES`' proper-noun labels. */
+export const THEMES = ["dark", "light", "system"] as const;
+
 export function sourceColor(s: string): string {
   return SOURCES.find(x => x.id === s)?.color ?? "#8e8e93";
 }
@@ -165,4 +185,25 @@ export function sourceColor(s: string): string {
 export const PENTEST_TAGS = [
   "all", "network", "web", "password", "wifi", "mitm", "exploit", "osint",
   "forensics", "reverse", "ad", "packet", "audit", "utility",
+];
+
+/** Tag pills for the Dev Tools view (see `DevToolsView.tsx`) — filters the
+ * grouped tool list by language/toolchain. */
+export const DEV_TOOLS_LANG_TAGS = ["all", "rust", "node", "python", "go", "java", "ruby", "php", "c", "cpp"];
+
+/** Default answer for DevToolsView's "how do you want this installed?"
+ * prompt (`AppSettings.dev_tools_default_mode`) — "ask" shows the
+ * Local-vs-Container dialog every time a tool with neither variant
+ * installed gets a fresh install click; "local"/"container" skip the
+ * dialog and always install that way. */
+export const DEV_TOOLS_DEFAULT_MODES = ["ask", "local", "container"] as const;
+/** Tag pills for the HackerOS Ecosystem view (see `EcosystemView.tsx`) —
+ * same idea as `PENTEST_TAGS`, curated down to the most useful groupings
+ * rather than every tag used in `data/packages.ts`'s `HACKEROS_ECOSYSTEM`
+ * array (e.g. "roblox" and "handheld" exist as tags there but aren't
+ * worth their own top-level pill among 27 entries; the search box still
+ * matches on them). */
+export const ECOSYSTEM_TAGS = [
+  "all", "gaming", "cybersecurity", "dev", "environment", "containers",
+  "drivers", "security", "ai", "desktop", "mode", "updates",
 ];
