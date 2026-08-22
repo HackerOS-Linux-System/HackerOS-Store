@@ -1,5 +1,12 @@
-export type Category = "game_launchers" | "pentest_tools" | "drivers" | "update" | "discover" | "settings" | "history" | "nix";
-export interface Package { name: string; desc: string; category: Category; icon: string; tags?: string[]; }
+export type Category = "game_launchers" | "pentest_tools" | "drivers" | "hackeros_ecosystem" | "dev_tools" | "update" | "discover" | "settings" | "history" | "nix";
+export interface Package {
+  name: string; desc: string; category: Category; icon: string; tags?: string[];
+  /** HackerOS Ecosystem only: false means `hacker` offers no way to remove
+   * this tool once unpacked (currently just Hydra) — the row shows a
+   * warning instead of an uninstall button. Defaults to true (removable)
+   * for every other category/entry. */
+  uninstallable?: boolean;
+}
 
 export const GAME_LAUNCHERS: Package[] = [
   { name:"Steam",            desc:"The largest PC gaming platform. Flatpak.",      category:"game_launchers", icon:"Gamepad2", tags:["flatpak","gaming"] },
@@ -177,12 +184,117 @@ export const DRIVERS: Package[] = [
   { name:"Firmware (non-free)", desc:"Linux non-free firmware: Realtek, Intel WiFi…",      category:"drivers", icon:"Wrench", tags:["firmware"] },
 ];
 
-// Only these curated sections (game launchers, pentest tools, drivers) are
-// covered by the local text search box — Discover intentionally searches
-// live against the package sources instead (see DiscoverView), not this
-// array, so it deliberately does not include any Discover-style apps.
+// Mirrors HACKEROS_ECOSYSTEM_CATALOG in src-tauri/src/lib.rs exactly — same
+// names in the same order, so the frontend catalog and the Rust
+// install-strategy/installed-state catalog can never drift apart. If you
+// add a tool here, add the matching (name, slug, uninstallable) row there
+// too. Install/uninstall run `hacker unpack <slug>` / `hacker pack <slug>`
+// on the backend; see lib.rs's HackerOS Ecosystem section for details.
+//
+// Descriptions are intentionally short for now — a bigger writeup for each
+// tool is planned for a future update.
+export const HACKEROS_ECOSYSTEM: Package[] = [
+  { name:"HackerOS TV",         desc:"Curated streaming & IPTV app hub for HackerOS.",             category:"hackeros_ecosystem", icon:"Tv",            tags:["media","tv"] },
+  { name:"Add-ons",             desc:"Optional extras and companion apps for HackerOS.",           category:"hackeros_ecosystem", icon:"Blocks",        tags:["addons"] },
+  { name:"GS",                  desc:"Gaming & cybersecurity bundle — tools from both worlds.",    category:"hackeros_ecosystem", icon:"Gauge",         tags:["gaming","cybersecurity"] },
+  { name:"Dev Tools",           desc:"Developer toolchain bundle for HackerOS.",                    category:"hackeros_ecosystem", icon:"Code",          tags:["dev"] },
+  { name:"Emulators",           desc:"Console and retro system emulator bundle.",                   category:"hackeros_ecosystem", icon:"MonitorPlay",   tags:["gaming","emulation"] },
+  { name:"Cybersecurity",       desc:"Core cybersecurity tool bundle for HackerOS.",                category:"hackeros_ecosystem", icon:"Shield",        tags:["cybersecurity"] },
+  { name:"Gaming",              desc:"General gaming bundle for HackerOS.",                         category:"hackeros_ecosystem", icon:"Gamepad2",      tags:["gaming"] },
+  { name:"Gaming — Roblox",     desc:"Roblox gaming support bundle.",                               category:"hackeros_ecosystem", icon:"Boxes",         tags:["gaming","roblox"] },
+  { name:"Hacker Mode",         desc:"Switches the desktop into HackerOS's Hacker Mode.",           category:"hackeros_ecosystem", icon:"Terminal",      tags:["mode"] },
+  { name:"Automatic Updates",   desc:"Enables automatic background updates for HackerOS.",          category:"hackeros_ecosystem", icon:"Repeat",        tags:["updates"] },
+  { name:"Alacritty Config",    desc:"HackerOS's curated Alacritty terminal configuration.",        category:"hackeros_ecosystem", icon:"SquareTerminal",tags:["terminal","config"] },
+  { name:"Winboat",             desc:"Run Windows apps aboard HackerOS via Winboat.",               category:"hackeros_ecosystem", icon:"Wine",          tags:["windows","compat"] },
+  { name:"NVIDIA Drivers",      desc:"HackerOS's own NVIDIA driver install flow (via `hacker`).",   category:"hackeros_ecosystem", icon:"Cpu",           tags:["gpu","nvidia","drivers"] },
+  { name:"HackerOS Containers", desc:"Container tooling and runtime for HackerOS.",                 category:"hackeros_ecosystem", icon:"Container",     tags:["containers"] },
+  { name:"H#",                  desc:"The H# language toolchain.",                                  category:"hackeros_ecosystem", icon:"Binary",        tags:["dev","language"] },
+  { name:"H# Utils",            desc:"Utility library and CLI tools for H#.",                       category:"hackeros_ecosystem", icon:"Wrench",        tags:["dev","language"] },
+  { name:"HackerOS Builder",    desc:"Build and packaging tool for HackerOS images/apps.",          category:"hackeros_ecosystem", icon:"HardHat",       tags:["dev","build"] },
+  { name:"Isolator",            desc:"Sandboxing/isolation tool for running apps safely.",          category:"hackeros_ecosystem", icon:"Lock",          tags:["security","sandbox"] },
+  { name:"Hydra",               desc:"HackerOS's Hydra environment. One-way install — cannot be removed via `hacker pack` once unpacked.", category:"hackeros_ecosystem", icon:"Skull", tags:["environment"], uninstallable:false },
+  { name:"Hammer",              desc:"HackerOS's `hammer` package-backend fallback tool.",          category:"hackeros_ecosystem", icon:"Hammer",        tags:["packages"] },
+  { name:"HackerOS Games",      desc:"Additional curated games for HackerOS.",                      category:"hackeros_ecosystem", icon:"PackagePlus",   tags:["gaming"] },
+  { name:"HexAi",               desc:"HackerOS's built-in AI assistant tool.",                      category:"hackeros_ecosystem", icon:"Brain",         tags:["ai"] },
+  { name:"HackerDeck",          desc:"Steam Deck-style handheld/gaming UI mode.",                   category:"hackeros_ecosystem", icon:"PlayCircle",    tags:["gaming","handheld"] },
+  { name:"Blue Environment",    desc:"The Blue desktop environment for HackerOS.",                  category:"hackeros_ecosystem", icon:"Cloud",         tags:["environment","desktop"] },
+  { name:"HWDE",                desc:"HackerOS Windows-style Desktop Environment.",                 category:"hackeros_ecosystem", icon:"Monitor",       tags:["environment","desktop"] },
+  { name:"Cybersecurity Mode",  desc:"Switches the desktop into a cybersecurity-focused mode.",     category:"hackeros_ecosystem", icon:"ShieldCheck",   tags:["cybersecurity","mode"] },
+  { name:"SDE",                 desc:"HackerOS's Secure Desktop Environment.",                      category:"hackeros_ecosystem", icon:"Layers3",       tags:["environment","security"] },
+];
+
+// Mirrors DEV_TOOLS_CATALOG in src-tauri/src/lib.rs: same eight toolchains,
+// each contributing exactly two rows here — "Local" (installed straight
+// onto the host via apt) and "Container" (installed inside the shared
+// `hackeros-devbox` Podman/Distrobox container, exposed on the host via a
+// `~/.local/bin/<tool>` wrapper). If you add a toolchain here, add the
+// matching (local name, container name, apt package, primary binary) row
+// on the Rust side too — install/uninstall dispatch by matching these
+// exact display-name strings, so the two catalogs can't drift apart.
+//
+// Both rows for a tool share `tags` (used by ECOSYSTEM_TAGS-style filter
+// pills in DevToolsView) plus one extra tag — "local" or "container" — so
+// the tag pills can also filter by install mode, not just by language.
+export const DEV_TOOLS: Package[] = [
+  { name:"Rust (cargo) — Local",              desc:"Rust toolchain (rustc + cargo) installed directly via apt.", category:"dev_tools", icon:"Cpu",     tags:["rust","local"] },
+  { name:"Rust (cargo) — Container",          desc:"Rust toolchain (rustc + cargo), isolated in the HackerOS Dev Tools container.", category:"dev_tools", icon:"Container", tags:["rust","container"] },
+
+  { name:"Node.js (npm) — Local",             desc:"Node.js runtime and npm installed directly via apt.",        category:"dev_tools", icon:"Terminal", tags:["node","javascript","local"] },
+  { name:"Node.js (npm) — Container",         desc:"Node.js runtime and npm, isolated in the HackerOS Dev Tools container.", category:"dev_tools", icon:"Container", tags:["node","javascript","container"] },
+
+  { name:"Python (pip) — Local",              desc:"Python 3 and pip installed directly via apt.",               category:"dev_tools", icon:"Code",    tags:["python","local"] },
+  { name:"Python (pip) — Container",          desc:"Python 3 and pip, isolated in the HackerOS Dev Tools container.", category:"dev_tools", icon:"Container", tags:["python","container"] },
+
+  { name:"Go — Local",                        desc:"The Go toolchain installed directly via apt.",                category:"dev_tools", icon:"Boxes",   tags:["go","local"] },
+  { name:"Go — Container",                    desc:"The Go toolchain, isolated in the HackerOS Dev Tools container.", category:"dev_tools", icon:"Container", tags:["go","container"] },
+
+  { name:"Java (JDK) — Local",                desc:"OpenJDK installed directly via apt.",                         category:"dev_tools", icon:"Coffee",  tags:["java","local"] },
+  { name:"Java (JDK) — Container",            desc:"OpenJDK, isolated in the HackerOS Dev Tools container.",      category:"dev_tools", icon:"Container", tags:["java","container"] },
+
+  { name:"Ruby (gem) — Local",                desc:"Ruby and RubyGems installed directly via apt.",               category:"dev_tools", icon:"Gem",     tags:["ruby","local"] },
+  { name:"Ruby (gem) — Container",            desc:"Ruby and RubyGems, isolated in the HackerOS Dev Tools container.", category:"dev_tools", icon:"Container", tags:["ruby","container"] },
+
+  { name:"PHP — Local",                       desc:"PHP CLI installed directly via apt.",                         category:"dev_tools", icon:"Code",    tags:["php","local"] },
+  { name:"PHP — Container",                   desc:"PHP CLI, isolated in the HackerOS Dev Tools container.",      category:"dev_tools", icon:"Container", tags:["php","container"] },
+
+  { name:"C/C++ (build-essential) — Local",     desc:"gcc, g++, make and friends installed directly via apt.",     category:"dev_tools", icon:"Wrench",  tags:["c","cpp","local"] },
+  { name:"C/C++ (build-essential) — Container", desc:"gcc, g++, make and friends, isolated in the HackerOS Dev Tools container.", category:"dev_tools", icon:"Container", tags:["c","cpp","container"] },
+];
+
+/** One row per language/toolchain (8, not 16) — pairs up each tool's
+ * Local and Container `Package` entries from `DEV_TOOLS` above so
+ * `DevToolsView.tsx` can render a single grouped row with one primary
+ * "Install" action (which then asks *how*, per
+ * `AppSettings.dev_tools_default_mode`) instead of showing two
+ * independent, easy-to-miss rows per tool. Relies on `DEV_TOOLS` being
+ * written as consecutive (Local, Container) pairs in the same order —
+ * if you add a toolchain there, keep that pairing and this derives the
+ * grouping automatically with no further changes needed. */
+export interface DevToolGroup { label: string; icon: string; tags: string[]; local: Package; container: Package; }
+export const DEV_TOOL_GROUPS: DevToolGroup[] = (() => {
+  const groups: DevToolGroup[] = [];
+  for (let i = 0; i + 1 < DEV_TOOLS.length; i += 2) {
+    const local = DEV_TOOLS[i];
+    const container = DEV_TOOLS[i + 1];
+    groups.push({
+      label: local.name.replace(/ — Local$/, ""),
+      icon: local.icon,
+      tags: (local.tags ?? []).filter(tg => tg !== "local"),
+      local, container,
+    });
+  }
+  return groups;
+})();
+
+// Only these curated sections (game launchers, pentest tools, drivers,
+// HackerOS Ecosystem, Dev Tools) are covered by the local text search
+// box — Discover intentionally searches live against the package sources
+// instead (see DiscoverView), not this array, so it deliberately does not
+// include any Discover-style apps.
 export const ALL_PACKAGES: Package[] = [
   ...GAME_LAUNCHERS,
   ...PENTEST_TOOLS,
   ...DRIVERS,
+  ...HACKEROS_ECOSYSTEM,
+  ...DEV_TOOLS,
 ];
