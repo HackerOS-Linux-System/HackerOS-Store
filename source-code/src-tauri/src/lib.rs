@@ -20,7 +20,7 @@ mod hnm;
 mod appimage;
 mod pkgbackend;
 
-use security::validate_pkg_token;
+use security::{validate_pkg_token, validate_display_name};
 
 // ─── Event payloads ──────────────────────────────────────────────────────────
 
@@ -229,6 +229,18 @@ pub struct AppSettings {
     /// Which section the app opens on when launched.
     #[serde(default = "default_section")]
     pub default_section: String,
+    /// UI color theme: "dark" | "light" | "system". Frontend owns the
+    /// actual CSS variables for each; the backend only persists the
+    /// chosen value, same as `language`.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// Default answer for "how do you want this Dev Tools entry
+    /// installed?": "ask" (default — show the Local/Container prompt
+    /// every time), "local", or "container". Purely a frontend concern
+    /// (DevToolsView.tsx) — the backend just persists it, same as
+    /// `theme`/`language`.
+    #[serde(default = "default_dev_tools_mode")]
+    pub dev_tools_default_mode: String,
 }
 
 fn default_language() -> String { "en".into() }
@@ -241,6 +253,8 @@ fn default_snap_channel() -> String { "stable".into() }
 fn default_true() -> bool { true }
 fn default_sources() -> Vec<String> { vec!["apt".into(), "flatpak".into(), "snap".into(), "brew".into(), "hpm".into()] }
 fn default_section() -> String { "discover".into() }
+fn default_theme() -> String { "dark".into() }
+fn default_dev_tools_mode() -> String { "ask".into() }
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -256,6 +270,8 @@ impl Default for AppSettings {
             snap_default_channel: default_snap_channel(),
             ratings_enabled: true,
             default_section: "discover".into(),
+            theme: default_theme(),
+            dev_tools_default_mode: default_dev_tools_mode(),
         }
     }
 }
@@ -1159,6 +1175,54 @@ async fn check_all_installed() -> Vec<InstalledState> {
         let version   = apt.get(*pkg).cloned();
         out.push(InstalledState { key: key.to_string(), installed, version });
     }
+
+    // HackerOS Ecosystem: installed state is this app's own marker files
+    // (see the module doc comment above `install_hackeros_tool`), not
+    // anything queried from `hacker` itself.
+    let marker_dir = hackeros_ecosystem_marker_dir();
+    for (name, slug, _) in HACKEROS_ECOSYSTEM_CATALOG {
+        let key = format!("hackeros_ecosystem::{name}");
+        let installed = marker_dir.join(slug).is_file();
+        out.push(InstalledState { key, installed, version: None });
+    }
+
+    // Dev Tools — "Local" variants: check via dpkg (fast, always run;
+    // `apt` is the same bulk lookup already built above).
+    for (local, _container, pkg, _bin) in DEV_TOOLS_CATALOG {
+        let key = format!("dev_tools::{local}");
+        let installed = apt.contains_key(*pkg);
+        let version   = apt.get(*pkg).cloned();
+        out.push(InstalledState { key, installed, version });
+    }
+
+    // Dev Tools — "Container" variants: same batched `command -v` probe
+    // inside `hackeros-devbox` the pentest tools use for their Kali
+    // container above, skipped entirely if that container doesn't exist
+    // yet and bounded by a timeout for the same reasons.
+    let mut dev_container_installed: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    if devbox_exists().await {
+        let bins: Vec<&str> = DEV_TOOLS_CATALOG.iter().map(|(_, _, _, bin)| *bin).collect();
+        let names_sh = bins.join(" ");
+        let script = format!(
+            "for t in {names_sh}; do command -v \"$t\" >/dev/null 2>&1 && echo \"$t:yes\" || echo \"$t:no\"; done"
+        );
+        let fut = Command::new("distrobox")
+            .args(["enter", "hackeros-devbox", "--", "sh", "-c", &script])
+            .env("DBX_CONTAINER_MANAGER", "podman")
+            .output();
+        if let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(6), fut).await {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Some((bin, state)) = line.split_once(':') {
+                    dev_container_installed.insert(bin.to_string(), state == "yes");
+                }
+            }
+        }
+    }
+    for (_local, container, _pkg, bin) in DEV_TOOLS_CATALOG {
+        let key = format!("dev_tools::{container}");
+        let installed = dev_container_installed.get(*bin).copied().unwrap_or(false);
+        out.push(InstalledState { key, installed, version: None });
+    }
     out
 }
 
@@ -1166,13 +1230,24 @@ async fn check_all_installed() -> Vec<InstalledState> {
 
 #[tauri::command]
 async fn install_package(app: tauri::AppHandle, name: String, category: String) -> Result<String, String> {
-    let name = validate_pkg_token(&name)?;
+    // Only `pentest_tools` names are ever interpolated into a raw shell/argv
+    // token (apt package name or Kali container command), so only that
+    // branch needs the strict `validate_pkg_token` allowlist — it's applied
+    // again inside `install_pentest` itself. The other curated categories
+    // (game_launchers, drivers, hackeros_ecosystem) only ever use `name` as
+    // a match key against a static Rust catalog; a name that doesn't match
+    // anything just falls through to "Unknown …" below, so a looser
+    // display-name check is enough and doesn't reject legitimate names like
+    // "NVIDIA Driver" or "Epic Games Store" that contain a space.
+    let name = validate_display_name(&name)?;
     reset_job(&app);
     emit_log(&app, "info", &format!("Starting installation of {}...", name));
     let result = match category.as_str() {
-        "game_launchers" => install_launcher(&app, &name).await,
-        "pentest_tools"  => install_pentest(&app, &name).await,
-        "drivers"        => install_driver(&app, &name).await,
+        "game_launchers"     => install_launcher(&app, &name).await,
+        "pentest_tools"      => install_pentest(&app, &name).await,
+        "drivers"            => install_driver(&app, &name).await,
+        "hackeros_ecosystem" => install_hackeros_tool(&app, &name).await,
+        "dev_tools"          => install_dev_tool(&app, &name).await,
         _ => Err(format!("Unknown category: {category}")),
     };
     reset_job(&app);
@@ -1192,10 +1267,26 @@ async fn install_package(app: tauri::AppHandle, name: String, category: String) 
     } else {
         let (hist_source, hist_pkg_id) = if pentest_apt_backed {
             ("apt".to_string(), apt_pkg_name(&name))
+        } else if category == "dev_tools" {
+            // Local variants are literally an apt package — piggyback on
+            // the same "apt" source/version-pin rollback pentest tools
+            // use. Container variants get their own source, same "undo
+            // the recorded action" rollback semantics as HackerOS
+            // Ecosystem — see history.rs.
+            match dev_tool_entry(&name) {
+                Some((_, _, pkg, _, false)) => ("apt".to_string(), pkg.to_string()),
+                Some((_, _, _, _, true))    => ("dev_tools_container".to_string(), name.clone()),
+                None                        => ("curated".to_string(), name.clone()),
+            }
+        } else if category == "hackeros_ecosystem" {
+            // Distinct from plain "curated" (game launchers) so
+            // `rollback_entry` can dispatch a `hacker pack`/`hacker unpack`
+            // undo specifically for these — see history.rs.
+            ("hackeros_ecosystem".to_string(), name.clone())
         } else {
             ("curated".to_string(), name.clone())
         };
-        let version = if result.is_ok() && pentest_apt_backed {
+        let version = if result.is_ok() && (pentest_apt_backed || hist_source == "apt") {
             history::current_apt_version(&hist_pkg_id).await
         } else { None };
         let _ = history::record("install", &hist_source, &name, &hist_pkg_id, version,
@@ -1210,18 +1301,32 @@ async fn install_package(app: tauri::AppHandle, name: String, category: String) 
 
 #[tauri::command]
 async fn uninstall_package(app: tauri::AppHandle, name: String, category: String) -> Result<String, String> {
-    let name = validate_pkg_token(&name)?;
+    let name = validate_display_name(&name)?;
     reset_job(&app);
     emit_log(&app, "info", &format!("Removing {}...", name));
     let result = match category.as_str() {
-        "game_launchers" => uninstall_launcher(&app, &name).await,
-        "pentest_tools"  => uninstall_pentest(&app, &name).await,
-        "drivers"        => uninstall_driver(&app, &name).await,
+        "game_launchers"     => uninstall_launcher(&app, &name).await,
+        "pentest_tools"      => uninstall_pentest(&app, &name).await,
+        "drivers"            => uninstall_driver(&app, &name).await,
+        "hackeros_ecosystem" => uninstall_hackeros_tool(&app, &name).await,
+        "dev_tools"          => uninstall_dev_tool(&app, &name).await,
         _ => Err(format!("Unknown category: {category}")),
     };
     reset_job(&app);
-    let hist_source = if (category == "pentest_tools" && in_debian(&name)) || category == "drivers" { "apt" } else { "curated" };
-    let _ = history::record("uninstall", hist_source, &name, &name, None,
+    let hist_source = if (category == "pentest_tools" && in_debian(&name)) || category == "drivers" {
+        "apt".to_string()
+    } else if category == "dev_tools" {
+        match dev_tool_entry(&name) {
+            Some((_, _, _, _, false)) => "apt".to_string(),
+            Some((_, _, _, _, true))  => "dev_tools_container".to_string(),
+            None                      => "curated".to_string(),
+        }
+    } else if category == "hackeros_ecosystem" {
+        "hackeros_ecosystem".to_string()
+    } else {
+        "curated".to_string()
+    };
+    let _ = history::record("uninstall", &hist_source, &name, &name, None,
         result.is_ok(), result.as_ref().err().cloned());
     result?;
     emit_log(&app, "success", &format!("{} removed successfully.", name));
@@ -1386,6 +1491,150 @@ async fn uninstall_pentest(app: &tauri::AppHandle, name: &str) -> Result<(), Str
     Ok(())
 }
 
+// ─── Dev Tools (Rust/cargo, Node.js/npm, Python, Go, Java, Ruby, PHP, C/C++) ──
+//
+// Assumes a fresh HackerOS install has none of these toolchains yet (no
+// cargo, no npm, ...) and offers two independent ways to get each one,
+// chosen per-row rather than as one global setting:
+//   - "Local" installs the real apt package straight onto the host —
+//     fastest, but its dependencies land directly on the base system.
+//   - "Container" keeps the host clean: every container-mode tool
+//     installs inside one shared Podman/Distrobox container
+//     (`hackeros-devbox`, created on first use, ~2-3 min), the same
+//     approach the Kali-only pentest tools above already use, right down
+//     to the `~/.local/bin/<tool>` wrapper that forwards a host
+//     invocation into the container. `DBX_CONTAINER_MANAGER=podman` is
+//     set explicitly on every distrobox call for this container, so it's
+//     always Podman doing the work — per the request that started this
+//     section — even on a system that also happens to have Docker
+//     installed (distrobox otherwise prefers Docker when both exist).
+//
+// Same host-PATH caveat as the pentest Kali wrappers applies if someone
+// installs *both* variants of the same tool: the `~/.local/bin/<tool>`
+// wrapper generally shadows the apt-installed binary in `/usr/bin` on
+// Debian's default PATH ordering. Neither this nor the pentest container
+// tries to detect or warn about that today.
+//
+// All eight apt package names below (cargo, npm, python3-pip, golang-go,
+// default-jdk, ruby-full, php-cli, build-essential) are long-standing,
+// widely-mirrored Debian main packages — high confidence these exist in
+// Debian testing/trixie without needing non-free or backports, unlike
+// some of the pentest catalog's Kali-only picks.
+const DEV_TOOLS_CATALOG: &[(&str, &str, &str, &str)] = &[
+    // (Local display name, Container display name, apt package, primary binary)
+    ("Rust (cargo) — Local",            "Rust (cargo) — Container",            "cargo",           "cargo"),
+    ("Node.js (npm) — Local",           "Node.js (npm) — Container",           "npm",             "npm"),
+    ("Python (pip) — Local",            "Python (pip) — Container",            "python3-pip",     "pip3"),
+    ("Go — Local",                      "Go — Container",                      "golang-go",       "go"),
+    ("Java (JDK) — Local",              "Java (JDK) — Container",              "default-jdk",     "javac"),
+    ("Ruby (gem) — Local",              "Ruby (gem) — Container",              "ruby-full",       "gem"),
+    ("PHP — Local",                     "PHP — Container",                     "php-cli",         "php"),
+    ("C/C++ (build-essential) — Local", "C/C++ (build-essential) — Container", "build-essential", "gcc"),
+];
+
+/// Looks `name` up against both the local- and container-display-name
+/// columns of [`DEV_TOOLS_CATALOG`]. Returns
+/// `(local_name, container_name, apt_pkg, primary_bin, is_container)`.
+fn dev_tool_entry(name: &str) -> Option<(&'static str, &'static str, &'static str, &'static str, bool)> {
+    DEV_TOOLS_CATALOG.iter().find_map(|(local, container, pkg, bin)| {
+        if *local == name { Some((*local, *container, *pkg, *bin, false)) }
+        else if *container == name { Some((*local, *container, *pkg, *bin, true)) }
+        else { None }
+    })
+}
+
+async fn ensure_podman(app: &tauri::AppHandle) -> Result<(), String> {
+    let ok = Command::new("which").arg("podman").output().await
+        .map(|o| o.status.success()).unwrap_or(false);
+    if ok { return Ok(()); }
+    emit_log(app, "info", "Installing podman...");
+    apt_install(app, &["podman"]).await
+}
+
+async fn devbox_exists() -> bool {
+    Command::new("distrobox").arg("list").env("DBX_CONTAINER_MANAGER", "podman")
+        .output().await
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("hackeros-devbox"))
+        .unwrap_or(false)
+}
+
+async fn ensure_devbox(app: &tauri::AppHandle) -> Result<(), String> {
+    if devbox_exists().await { return Ok(()); }
+    emit_log(app, "info", "Creating the HackerOS Dev Tools container (Podman, first run ~2-3 min)...");
+    emit_prog(app, "install", "Creating dev tools container...", 0.15);
+    run_streaming_env(
+        app,
+        &["distrobox", "create", "--image", "debian:trixie-slim", "--name", "hackeros-devbox", "--yes"],
+        &[("DBX_CONTAINER_MANAGER", "podman")],
+    ).await?;
+    let _ = run_streaming_env(
+        app,
+        &["distrobox", "enter", "hackeros-devbox", "--", "sudo", "apt-get", "update", "-qq"],
+        &[("DBX_CONTAINER_MANAGER", "podman")],
+    ).await;
+    Ok(())
+}
+
+async fn install_dev_tool(app: &tauri::AppHandle, name: &str) -> Result<(), String> {
+    let name = validate_display_name(name)?;
+    let (_, _, pkg, bin, container) = dev_tool_entry(&name)
+        .ok_or_else(|| format!("Unknown Dev Tools entry: {name}"))?;
+    if !container {
+        emit_log(app, "info", &format!("Installing {} from Debian repos...", name));
+        emit_prog(app, "install", &format!("Installing {}...", name), 0.2);
+        apt_install(app, &[pkg]).await?;
+    } else {
+        ensure_podman(app).await?;
+        check_cancel(app)?;
+        ensure_distrobox(app).await?;
+        check_cancel(app)?;
+        ensure_devbox(app).await?;
+        check_cancel(app)?;
+        emit_log(app, "info", &format!("Installing {} in the dev tools container...", name));
+        emit_prog(app, "install", &format!("Installing {} in container...", name), 0.6);
+        run_streaming_env(
+            app,
+            &["distrobox", "enter", "hackeros-devbox", "--", "sudo", "apt-get", "install", "-y", pkg],
+            &[("DBX_CONTAINER_MANAGER", "podman")],
+        ).await?;
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let bindir = format!("{home}/.local/bin");
+        std::fs::create_dir_all(&bindir).ok();
+        let w = format!("{bindir}/{bin}");
+        std::fs::write(&w, format!(
+            "#!/bin/sh\nDBX_CONTAINER_MANAGER=podman distrobox enter hackeros-devbox -- {bin} \"$@\"\n"
+        )).ok();
+        let _ = std::process::Command::new("chmod").args(["755", &w]).output();
+    }
+    emit_prog(app, "done", "Done!", 1.0);
+    Ok(())
+}
+
+async fn uninstall_dev_tool(app: &tauri::AppHandle, name: &str) -> Result<(), String> {
+    let name = validate_display_name(name)?;
+    let (_, _, pkg, bin, container) = dev_tool_entry(&name)
+        .ok_or_else(|| format!("Unknown Dev Tools entry: {name}"))?;
+    if !container {
+        emit_log(app, "info", &format!("Removing {} (apt)...", name));
+        emit_prog(app, "uninstall", &format!("Removing {}...", name), 0.3);
+        apt_remove(app, &[pkg]).await?;
+    } else {
+        emit_log(app, "info", &format!("Removing {} from the dev tools container...", name));
+        emit_prog(app, "uninstall", &format!("Removing {}...", name), 0.3);
+        if devbox_exists().await {
+            let _ = run_streaming_env(
+                app,
+                &["distrobox", "enter", "hackeros-devbox", "--", "sudo", "apt-get", "remove", "-y", pkg],
+                &[("DBX_CONTAINER_MANAGER", "podman")],
+            ).await;
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let _ = std::fs::remove_file(format!("{home}/.local/bin/{bin}"));
+    }
+    emit_prog(app, "done", "Removed.", 1.0);
+    Ok(())
+}
+
 /// Flatpak IDs for the game launchers that are Flatpak-based (as opposed to
 /// the Wine-based ones handled by `wine_launcher_meta`). Used by
 /// `get_package_info` to fetch size/version for the "game_launchers"
@@ -1430,6 +1679,131 @@ fn driver_pkgs(name: &str) -> Result<&'static [&'static str], String> {
         "Firmware (non-free)" => &["firmware-linux-nonfree","firmware-misc-nonfree","firmware-realtek","firmware-iwlwifi","firmware-atheros"],
         _ => return Err(format!("Unknown driver: {name}")),
     })
+}
+
+// ─── HackerOS Ecosystem ──────────────────────────────────────────────────────
+//
+// A grab-bag of first-party HackerOS tools/add-ons/environments that are
+// installed and removed through the system's own `hacker` CLI rather than
+// apt/flatpak/snap/etc: `hacker unpack <slug>` / `hacker pack <slug>`.
+// Mirrors HACKEROS_ECOSYSTEM in src/data/packages.ts exactly — same names
+// in the same order — so the two catalogs can't drift apart. If you add a
+// tool here, add the matching row there too.
+//
+// `hacker` itself does its own state tracking, but exposes no query command
+// this app can parse portably, so installed/not-installed here is tracked
+// with a small marker file per tool at `~/.hackeros/ecosystem/<slug>` —
+// written right after a successful `unpack` and removed right after a
+// successful `pack`. That marker is this app's own bookkeeping, not a
+// property `hacker` reports back, so it can in principle drift from reality
+// if a tool is unpacked/packed some other way outside the Store; the "not
+// detected" hint next to the source toggles elsewhere in the app follows
+// the same "best effort, not ground truth" philosophy.
+const HACKEROS_ECOSYSTEM_CATALOG: &[(&str, &str, bool)] = &[
+    // (display name, `hacker` slug, uninstallable)
+    ("HackerOS TV",            "hackeros-tv",         true),
+    ("Add-ons",                "add-ons",             true),
+    ("GS",                     "gs",                  true),
+    ("Dev Tools",              "devtools",            true),
+    ("Emulators",              "emulators",           true),
+    ("Cybersecurity",          "cybersecurity",       true),
+    ("Gaming",                 "gaming",              true),
+    ("Gaming — Roblox",        "gaming-roblox",       true),
+    ("Hacker Mode",            "hacker-mode",         true),
+    ("Automatic Updates",      "automatic-updates",   true),
+    ("Alacritty Config",       "alacritty-config",    true),
+    ("Winboat",                "winboat",             true),
+    ("NVIDIA Drivers",         "nvidia-drivers",      true),
+    ("HackerOS Containers",    "hackeros-containers", true),
+    ("H#",                     "h#",                  true),
+    ("H# Utils",               "h#-utils",            true),
+    ("HackerOS Builder",       "hackeros-builder",    true),
+    ("Isolator",               "isolator",            true),
+    // Hydra is install-only — `hacker` offers no way to remove it once
+    // unpacked (see the UI's warning next to this row).
+    ("Hydra",                  "hydra",               false),
+    ("Hammer",                 "hammer",              true),
+    ("HackerOS Games",         "hackeros-games",      true),
+    ("HexAi",                  "hexai",               true),
+    ("HackerDeck",             "hackerdeck",          true),
+    ("Blue Environment",       "blue-environment",    true),
+    ("HWDE",                   "hwde",                true),
+    ("Cybersecurity Mode",     "cybersecurity-mode",  true),
+    ("SDE",                    "sde",                 true),
+];
+
+fn hackeros_ecosystem_entry(name: &str) -> Option<(&'static str, &'static str, bool)> {
+    HACKEROS_ECOSYSTEM_CATALOG.iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(n, slug, uninstallable)| (*n, *slug, *uninstallable))
+}
+
+fn hackeros_ecosystem_marker_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    std::path::PathBuf::from(format!("{home}/.hackeros/ecosystem"))
+}
+
+async fn install_hackeros_tool(app: &tauri::AppHandle, name: &str) -> Result<(), String> {
+    let (_, slug, _) = hackeros_ecosystem_entry(name).ok_or_else(|| format!("Unknown HackerOS Ecosystem tool: {name}"))?;
+    emit_log(app, "info", &format!("Unpacking {} (`hacker unpack {}`)...", name, slug));
+    emit_prog(app, "install", &format!("Installing {}...", name), 0.2);
+    run_streaming(app, &["hacker", "unpack", slug]).await?;
+    let dir = hackeros_ecosystem_marker_dir();
+    std::fs::create_dir_all(&dir).ok();
+    std::fs::write(dir.join(slug), chrono_now_string()).ok();
+    emit_prog(app, "done", "Done!", 1.0);
+    Ok(())
+}
+
+async fn uninstall_hackeros_tool(app: &tauri::AppHandle, name: &str) -> Result<(), String> {
+    let (_, slug, uninstallable) = hackeros_ecosystem_entry(name).ok_or_else(|| format!("Unknown HackerOS Ecosystem tool: {name}"))?;
+    if !uninstallable {
+        return Err(format!("{name} cannot be removed via `hacker pack` — this is a one-way install."));
+    }
+    emit_log(app, "info", &format!("Packing {} (`hacker pack {}`)...", name, slug));
+    emit_prog(app, "uninstall", &format!("Removing {}...", name), 0.3);
+    run_streaming(app, &["hacker", "pack", slug]).await?;
+    let _ = std::fs::remove_file(hackeros_ecosystem_marker_dir().join(slug));
+    emit_prog(app, "done", "Removed.", 1.0);
+    Ok(())
+}
+
+/// Cheap timestamp for the ecosystem marker files — avoids pulling in the
+/// `chrono` / `time` crates just to stamp a file nobody parses back out.
+fn chrono_now_string() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
+}
+
+/// Whether the `hacker` CLI itself is on PATH — surfaced in the Ecosystem
+/// view so a missing CLI shows a clear banner instead of every install just
+/// silently failing with a "command not found" buried in the log.
+#[tauri::command]
+async fn is_hacker_available() -> bool {
+    Command::new("which").arg("hacker")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status().await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Whether Podman itself is on PATH — surfaced in the Dev Tools view (same
+/// idea as `is_hacker_available` for HackerOS Ecosystem) so a person sees
+/// a clear heads-up instead of the first Container-mode install just
+/// silently taking longer than expected while it installs Podman via apt
+/// first (`ensure_podman`, above, does that automatically either way —
+/// this is purely informational).
+#[tauri::command]
+async fn is_podman_available() -> bool {
+    Command::new("which").arg("podman")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status().await
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // ─── update_system ────────────────────────────────────────────────────────────
@@ -2641,7 +3015,13 @@ fn save_persisted_queue(jobs: Vec<queue_store::PersistedJob>) -> Result<(), Stri
 
 #[tauri::command]
 async fn get_package_info(name: String, category: String) -> serde_json::Value {
-    let name = match validate_pkg_token(&name) {
+    // Same split as `install_package`/`uninstall_package`: only
+    // `pentest_tools` names are ever fed to apt/dpkg as a raw token here
+    // (via `apt_pkg_name`), so only that branch needs the strict allowlist.
+    // The others just key into a static Rust catalog, so a rejection there
+    // would incorrectly turn e.g. "NVIDIA Driver"'s info button into a
+    // permanent error.
+    let name = match validate_display_name(&name) {
         Ok(n) => n,
         Err(e) => return serde_json::json!({"size": null, "version": null, "note": e}),
     };
@@ -2655,10 +3035,36 @@ async fn get_package_info(name: String, category: String) -> serde_json::Value {
             }
         },
         "pentest_tools" => {
-            if in_debian(&name) { apt_show_info(&apt_pkg_name(&name)).await }
-            else { serde_json::json!({"size": null, "version": null, "note": "Installed inside the Kali container — size not tracked by apt."}) }
+            if in_debian(&name) {
+                match validate_pkg_token(&apt_pkg_name(&name)) {
+                    Ok(pkg) => apt_show_info(&pkg).await,
+                    Err(e) => serde_json::json!({"size": null, "version": null, "note": e}),
+                }
+            } else { serde_json::json!({"size": null, "version": null, "note": "Installed inside the Kali container — size not tracked by apt."}) }
         },
-        "drivers" => apt_show_info(&name).await,
+        "drivers" => {
+            // `driver_pkgs` returns every apt package a driver entry
+            // installs (e.g. "NVIDIA Driver" -> nvidia-driver +
+            // firmware-misc-nonfree) — show info for the first/main one
+            // rather than `apt show`-ing the display name itself, which
+            // isn't a real package and would always fail.
+            match driver_pkgs(&name).ok().and_then(|p| p.first().copied()) {
+                Some(pkg) => apt_show_info(pkg).await,
+                None => serde_json::json!({"size": null, "version": null, "note": format!("Unknown driver: {name}")}),
+            }
+        },
+        "hackeros_ecosystem" => serde_json::json!({
+            "size": null, "version": null,
+            "note": "Managed by the `hacker` CLI (unpack/pack) — size and version aren't tracked here.",
+        }),
+        "dev_tools" => match dev_tool_entry(&name) {
+            Some((_, _, pkg, _, false)) => apt_show_info(pkg).await,
+            Some((_, _, _, _, true)) => serde_json::json!({
+                "size": null, "version": null,
+                "note": "Installed inside the hackeros-devbox Podman container — size not tracked by apt on the host.",
+            }),
+            None => serde_json::json!({"size": null, "version": null, "note": format!("Unknown Dev Tools entry: {name}")}),
+        },
         _ => serde_json::json!({"size":null,"version":null}),
     }
 }
@@ -2707,6 +3113,60 @@ fn save_settings(settings: AppSettings) -> Result<(), String> {
 fn reset_settings() -> AppSettings {
     let _ = std::fs::remove_file(settings_path());
     AppSettings::default()
+}
+
+/// Expands a leading `~/` to the user's home directory — the only shell-ism
+/// worth supporting here, since a person typing a backup path by hand will
+/// naturally reach for it. Anything else (absolute or relative paths) is
+/// passed through untouched.
+fn expand_home_path(path: &str) -> std::path::PathBuf {
+    let path = path.trim();
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        std::path::PathBuf::from(format!("{home}/{rest}"))
+    } else if path.is_empty() {
+        default_settings_backup_path()
+    } else {
+        std::path::PathBuf::from(path)
+    }
+}
+
+fn default_settings_backup_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    std::path::PathBuf::from(format!("{home}/hackeros-store-settings.json"))
+}
+
+/// Writes the current settings to a standalone JSON file so a person can
+/// carry their configuration (enabled sources, flatpak remotes, language,
+/// theme, etc.) to a reinstalled system or a second machine — `save_settings`
+/// only ever writes to the app's own fixed `settings.json`, this is the
+/// export half of that. `path` defaults to `~/hackeros-store-settings.json`
+/// when empty. Returns the path actually written to, so the UI can show it.
+#[tauri::command]
+fn export_settings_snapshot(path: Option<String>) -> Result<String, String> {
+    let settings = current_settings();
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    let dest = expand_home_path(&path.unwrap_or_default());
+    if let Some(dir) = dest.parent() { std::fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
+    std::fs::write(&dest, json).map_err(|e| e.to_string())?;
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Reads a previously-exported settings JSON file and makes it the app's
+/// active settings (via the same `save_settings` path a normal Settings
+/// save uses) — the counterpart to `export_settings_snapshot`. Rejects a
+/// file that isn't valid `AppSettings` JSON rather than partially applying
+/// it, so a typo'd or corrupted backup can't silently wipe out working
+/// configuration.
+#[tauri::command]
+fn import_settings_snapshot(path: Option<String>) -> Result<AppSettings, String> {
+    let src = expand_home_path(&path.unwrap_or_default());
+    let text = std::fs::read_to_string(&src)
+        .map_err(|e| format!("Couldn't read {}: {e}", src.display()))?;
+    let settings: AppSettings = serde_json::from_str(&text)
+        .map_err(|e| format!("That doesn't look like a HackerOS Store settings file: {e}"))?;
+    save_settings(settings.clone())?;
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -2776,6 +3236,8 @@ pub fn run() {
             get_settings,
             save_settings,
             reset_settings,
+            export_settings_snapshot,
+            import_settings_snapshot,
             get_app_info,
             clear_cache,
             submit_rating,
@@ -2790,6 +3252,8 @@ pub fn run() {
             is_hpm_available,
             is_nix_available,
             is_apt_available,
+            is_hacker_available,
+            is_podman_available,
             nix_list_generations,
             nix_store_size,
             nix_list_installed,
