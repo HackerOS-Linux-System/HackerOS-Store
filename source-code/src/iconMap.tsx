@@ -8,6 +8,8 @@ import {
   Headphones, Shield, PenTool, Palette, Ruler, Printer, BookOpen, Radio,
   Cpu, Wrench, Package as PackageIcon, Coffee, Fingerprint, Snowflake,
   Star, WifiOff, History, ListOrdered, RotateCcw, AlertTriangle,
+  Tv, Blocks, Gauge, MonitorPlay, Boxes, Repeat, SquareTerminal, Container,
+  HardHat, Hammer, PackagePlus, ShieldCheck, Layers3,
 } from "lucide-solid";
 import type { JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
@@ -30,6 +32,8 @@ export const ICONS: Record<string, IconComponent> = {
   GitCompare, Terminal, PlayCircle, Music, Film, Scissors, Video, Camera,
   Headphones, Shield, PenTool, Palette, Ruler, Printer, BookOpen, Radio,
   Cpu, Wrench, Coffee, Fingerprint,
+  Tv, Blocks, Gauge, MonitorPlay, Boxes, Repeat, SquareTerminal, Container,
+  HardHat, Hammer, PackagePlus, ShieldCheck, Layers3,
 };
 
 /** Icons for the ad-hoc "Discover" search results, keyed by package source. */
