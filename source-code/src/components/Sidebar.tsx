@@ -1,5 +1,5 @@
 import { For, Show } from "solid-js";
-import { Search, X, ChevronRight, Terminal, Loader2 } from "lucide-solid";
+import { Search, X, ChevronRight, Terminal, Loader2, Sun, Moon, Monitor } from "lucide-solid";
 import type { Category } from "../data/packages";
 import type { AppInfo, QueueJob } from "../types";
 import { QueuePanel } from "./QueuePanel";
@@ -7,6 +7,16 @@ import { useI18n } from "../hooks/useI18n";
 import type { IconComponent } from "../iconMap";
 
 export interface NavItem { id: Category; label: string; icon: IconComponent; badge?: number; }
+
+/** Cycles dark -> light -> system -> dark on each click of the sidebar's
+ * quick-toggle button (see `sidebar-footer` below). Kept as a plain
+ * function (not inline) since `SettingsView`'s theme pills need the same
+ * three-way set of values and this keeps the cycle order in one place. */
+function nextTheme(current: string): string {
+  if (current === "dark") return "light";
+  if (current === "light") return "system";
+  return "dark";
+}
 
 export function Sidebar(props: {
   navItems: NavItem[];
@@ -23,8 +33,11 @@ export function Sidebar(props: {
   onDequeue: (id: string) => void;
   onReorderQueue: (id: string, direction: "up" | "down") => void;
   searchInputRef?: (el: HTMLInputElement) => void;
+  theme: string;
+  onSetTheme: (t: string) => void;
 }) {
   const { t } = useI18n();
+  const ThemeIcon = () => (props.theme === "light" ? Sun : props.theme === "system" ? Monitor : Moon);
   return (
     <aside class="sidebar">
       <div class="sidebar-logo">
@@ -65,6 +78,12 @@ export function Sidebar(props: {
           <Show when={props.logActive}><Loader2 size={11} class="spin" /></Show>
         </button>
       </Show>
+
+      <button class="theme-toggle" onClick={() => props.onSetTheme(nextTheme(props.theme))}
+        title={t(`settings.theme.${props.theme}`)} aria-label={t("settings.theme")}>
+        {(() => { const Icon = ThemeIcon(); return <Icon size={13} />; })()}
+        <span>{t(`settings.theme.${props.theme}`)}</span>
+      </button>
 
       <div class="sidebar-footer">
         v{props.appInfo?.version ?? "0.7.0"} · {props.appInfo?.target_release?.split(" ")[0] ?? "Debian"}
