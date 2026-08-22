@@ -6,9 +6,45 @@
   --accent:#3b82f6;--accent2:#2563eb;--accent-g:rgba(59,130,246,0.22);
   --green:#22c55e;--green-dim:rgba(34,197,94,0.10);--red:#ef4444;
   --radius:10px;--radius-sm:6px;--radius-lg:14px;
+  /* Used by `.store-hero`/`.discover-hero`'s gradient — kept as its own
+     set of variables (rather than reusing --bg*) so the light theme below
+     can give the hero its own subtle tint instead of just going flat
+     white, while everything else in the light palette stays properly
+     light. */
+  --hero-from:#16162a;--hero-mid:#0d0d1c;--hero-to:#0a0a10;
   font-family:-apple-system,"Inter","Segoe UI",system-ui,sans-serif;
   font-size:14px;color:var(--text);background:var(--bg);
 }
+
+/* ── Light theme ──────────────────────────────────────────────────────────
+   Toggled by setting `data-theme` on the document root — see
+   `useSettings.ts`'s `applyTheme()`. "system" mirrors whichever this
+   block/the default `:root` block matches based on the OS's own
+   `prefers-color-scheme`, via the `@media` block further down.
+   The terminal/log panel (`.terminal-modal` and friends) and toast
+   backgrounds are deliberately left dark in both themes — they're
+   already high-contrast, self-contained overlays (like a real terminal
+   window), and switching them to a light background would hurt log
+   readability more than it'd help visual consistency. */
+:root[data-theme="light"]{
+  --bg:#f7f7f9;--bg2:#ffffff;--bg3:#f1f1f4;--bg4:#e7e7ec;--bg5:#dadae0;
+  --border:rgba(0,0,0,0.09);--border2:rgba(0,0,0,0.15);
+  --text:#17171b;--text2:#55555f;--text3:#93939c;
+  --accent:#2563eb;--accent2:#1d4ed8;--accent-g:rgba(37,99,235,0.14);
+  --green:#16a34a;--green-dim:rgba(22,163,74,0.09);--red:#dc2626;
+  --hero-from:#e9edfb;--hero-mid:#eef0f9;--hero-to:#f7f7f9;
+}
+@media (prefers-color-scheme: light){
+  :root[data-theme="system"]{
+    --bg:#f7f7f9;--bg2:#ffffff;--bg3:#f1f1f4;--bg4:#e7e7ec;--bg5:#dadae0;
+    --border:rgba(0,0,0,0.09);--border2:rgba(0,0,0,0.15);
+    --text:#17171b;--text2:#55555f;--text3:#93939c;
+    --accent:#2563eb;--accent2:#1d4ed8;--accent-g:rgba(37,99,235,0.14);
+    --green:#16a34a;--green-dim:rgba(22,163,74,0.09);--red:#dc2626;
+    --hero-from:#e9edfb;--hero-mid:#eef0f9;--hero-to:#f7f7f9;
+  }
+}
+
 body{overflow:hidden}
 .app{display:flex;height:100vh;width:100vw;overflow:hidden}
 
@@ -40,6 +76,8 @@ body{overflow:hidden}
 .log-toggle:hover{background:rgba(59,130,246,.18)}
 
 .sidebar-footer{padding:10px 16px;font-size:.68em;color:var(--text3);border-top:1px solid var(--border);text-align:center;letter-spacing:.03em}
+.theme-toggle{display:flex;align-items:center;justify-content:center;gap:7px;margin:0 8px 8px;padding:7px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text2);font-size:.76em;font-weight:600;cursor:pointer;transition:background .12s,color .12s}
+.theme-toggle:hover{background:var(--bg4);color:var(--text)}
 
 /* ── Main ── */
 .main{flex:1;overflow-y:auto;background:var(--bg);min-width:0}
@@ -50,6 +88,10 @@ body{overflow:hidden}
 /* ── View ── */
 .view{padding:28px 32px 48px;max-width:860px}
 .view-title{font-size:1.5em;font-weight:700;letter-spacing:-.02em;margin-bottom:6px}
+.view-header-row{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.view-header-row .view-title{margin-bottom:0}
+.btn.btn-install-all{background:var(--bg3);border:1px solid var(--border2);color:var(--text);flex-shrink:0;margin-top:2px}
+.btn.btn-install-all:hover{background:var(--bg4);border-color:var(--accent)}
 .view-sub{font-size:.85em;color:var(--text2);margin-bottom:20px;line-height:1.55}
 .nix-title-icon{vertical-align:-3px;margin-right:6px;color:#7ebae4}
 .nix-unavailable .settings-hint{color:#f87171}
@@ -62,7 +104,7 @@ body{overflow:hidden}
 .section-heading{font-size:1em;font-weight:600;color:var(--text2);margin:28px 0 12px;letter-spacing:-.01em}
 
 /* ── Store hero ── */
-.store-hero{background:linear-gradient(135deg,#16162a 0%,#0d0d1c 50%,#0a0a10 100%);border:1px solid var(--border);border-radius:var(--radius-lg);padding:34px 32px 28px;margin-bottom:22px;position:relative;overflow:hidden}
+.store-hero{background:linear-gradient(135deg,var(--hero-from) 0%,var(--hero-mid) 50%,var(--hero-to) 100%);border:1px solid var(--border);border-radius:var(--radius-lg);padding:34px 32px 28px;margin-bottom:22px;position:relative;overflow:hidden}
 .store-hero::before{content:"";position:absolute;top:-70px;right:-70px;width:260px;height:260px;background:radial-gradient(circle,rgba(59,130,246,.13) 0%,transparent 70%);pointer-events:none}
 .store-hero-badge{display:inline-block;font-size:.69em;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.25);border-radius:20px;padding:3px 10px;margin-bottom:10px}
 .store-hero-title{font-size:1.75em;font-weight:800;letter-spacing:-.03em;margin-bottom:5px}
@@ -116,6 +158,8 @@ body{overflow:hidden}
 .btn-uninstall-wide{display:inline-flex;align-items:center;gap:7px;background:none;border:1px solid var(--border);color:var(--text2);border-radius:var(--radius-sm);padding:9px 16px;font-size:.82em;font-weight:600;cursor:pointer;transition:all .12s}
 .btn-uninstall-wide:hover{background:rgba(239,68,68,.10);color:#f87171;border-color:rgba(239,68,68,.28)}
 .btn-uninstall-wide:disabled{opacity:.5;cursor:not-allowed}
+.btn-uninstall--locked{opacity:.6;cursor:default;color:var(--text3)}
+.btn-uninstall--locked:hover{background:none;color:var(--text3);border-color:var(--border)}
 
 /* ── Tag pills ── */
 .tag-pills{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
@@ -123,6 +167,29 @@ body{overflow:hidden}
 .tag-pill:hover{background:var(--bg4);color:var(--text)}
 .tag-pill.active{background:rgba(239,68,68,.10);color:#f87171;border-color:rgba(239,68,68,.28)}
 .pentest-count{font-size:.77em;color:var(--text3);margin-bottom:10px}
+
+/* ── Dev Tools mode toggle (Local vs Container) ── */
+.mode-toggle{display:inline-flex;gap:3px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);padding:3px;margin-bottom:12px}
+.mode-toggle-btn{display:inline-flex;align-items:center;gap:5px;padding:5px 13px;border:none;background:transparent;border-radius:5px;color:var(--text2);font-size:.78em;font-weight:600;cursor:pointer;transition:all .12s;text-transform:capitalize}
+.mode-toggle-btn:hover{color:var(--text)}
+.mode-toggle-btn.active{background:var(--accent);color:#fff}
+
+/* ── Dev Tools grouped rows (DevToolGroupRow) ── */
+.devtool-row-actions{gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.devtool-mode-badge{display:flex;align-items:center;gap:6px;background:var(--green-dim);border:1px solid rgba(34,197,94,.22);color:var(--green);border-radius:20px;padding:5px 6px 5px 10px;font-size:.72em;font-weight:600;white-space:nowrap}
+.devtool-mode-badge .btn-uninstall{padding:3px 5px;border:none;background:none;color:var(--green)}
+.devtool-mode-badge .btn-uninstall:hover{color:#f87171}
+.btn-add-mode{display:inline-flex;align-items:center;gap:4px;background:none;border:1px dashed var(--border2);color:var(--text2);border-radius:20px;padding:5px 10px;font-size:.72em;font-weight:600;cursor:pointer;transition:all .12s;white-space:nowrap}
+.btn-add-mode:hover{border-color:var(--accent);color:var(--accent);border-style:solid}
+
+/* ── Dev Tools "how do you want this installed?" prompt ── */
+.devtool-prompt-modal{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-lg);width:min(460px,92vw);padding:26px;position:relative;box-shadow:0 24px 70px rgba(0,0,0,.55)}
+.devtool-prompt-title{font-size:1.15em;font-weight:700;letter-spacing:-.01em;margin-bottom:6px;padding-right:24px}
+.devtool-prompt-choices{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:16px 0}
+.devtool-prompt-choice{display:flex;flex-direction:column;align-items:flex-start;gap:6px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:14px;cursor:pointer;transition:all .13s;text-align:left;color:var(--text)}
+.devtool-prompt-choice:hover{border-color:var(--accent);background:var(--bg4)}
+.devtool-prompt-choice-title{font-size:.9em;font-weight:700}
+.devtool-prompt-choice-desc{font-size:.74em;color:var(--text2);line-height:1.4}
 
 /* ── Buttons ── */
 .btn{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;border-radius:var(--radius-sm);border:none;font-size:.8em;font-weight:600;cursor:pointer;white-space:nowrap;transition:all .13s;letter-spacing:.01em;flex-shrink:0}
@@ -212,7 +279,7 @@ body{overflow:hidden}
 .detail-size-unknown{font-style:italic;color:var(--text3);opacity:.8}
 
 /* ── Discover (live browse) ── */
-.discover-hero{background:linear-gradient(135deg,#16162a 0%,#0d0d1c 50%,#0a0a10 100%);border:1px solid var(--border);border-radius:var(--radius-lg);padding:34px 32px 28px;margin-bottom:22px;position:relative;overflow:hidden}
+.discover-hero{background:linear-gradient(135deg,var(--hero-from) 0%,var(--hero-mid) 50%,var(--hero-to) 100%);border:1px solid var(--border);border-radius:var(--radius-lg);padding:34px 32px 28px;margin-bottom:22px;position:relative;overflow:hidden}
 .discover-hero::before{content:"";position:absolute;top:-70px;right:-70px;width:260px;height:260px;background:radial-gradient(circle,rgba(59,130,246,.13) 0%,transparent 70%);pointer-events:none}
 .discover-warning{display:flex;align-items:center;gap:8px;color:#fbbf24;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.22);border-radius:var(--radius-sm);padding:9px 13px;font-size:.8em;margin-bottom:16px}
 
