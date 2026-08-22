@@ -1,13 +1,13 @@
-import { createSignal, createMemo, onMount, onCleanup, Show } from "solid-js";
+import { createSignal, createMemo, createEffect, onMount, onCleanup, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ShoppingBag, Gamepad2, Shield, Cpu, RefreshCw, Settings as SettingsIcon, History as HistoryIcon,
-  Snowflake,
+  Snowflake, Blocks, SquareTerminal,
 } from "lucide-solid";
 import {
   ALL_PACKAGES, GAME_LAUNCHERS, DRIVERS, type Package, type Category,
 } from "./data/packages";
-import type { AppInfo, DiscoverItem, QueueJob } from "./types";
+import type { AppInfo, DiscoverItem, DiscoverResponse, DiscoverResult, QueueJob } from "./types";
 import "./App.css";
 
 import { useI18n } from "./hooks/useI18n";
@@ -26,13 +26,15 @@ import { AppDetailModal } from "./components/AppDetailModal";
 import { DiscoverView } from "./components/DiscoverView";
 import { PackageList } from "./components/PackageList";
 import { PentestView } from "./components/PentestView";
+import { EcosystemView } from "./components/EcosystemView";
+import { DevToolsView } from "./components/DevToolsView";
 import { UpdateView } from "./components/UpdateView";
 import { SettingsView } from "./components/SettingsView";
 import { HistoryView } from "./components/HistoryView";
 import { NixView } from "./components/NixView";
 import { SearchResults } from "./components/SearchResults";
 
-const VALID_SECTIONS: Category[] = ["discover", "game_launchers", "pentest_tools", "drivers", "update", "settings", "history", "nix"];
+const VALID_SECTIONS: Category[] = ["discover", "game_launchers", "pentest_tools", "drivers", "hackeros_ecosystem", "dev_tools", "update", "settings", "history", "nix"];
 
 interface CuratedPayload { name: string; category: string; }
 interface DiscoverPayload {
@@ -56,12 +58,18 @@ export default function App() {
   const [installing, setInstalling] = createSignal<Record<string, boolean>>({});
   const [uninstalling, setUninstalling] = createSignal<Record<string, boolean>>({});
   const [pentestTag, setPentestTag] = createSignal("all");
+  const [ecosystemTag, setEcosystemTag] = createSignal("all");
+  const [devToolsLangTag, setDevToolsLangTag] = createSignal("all");
   const [updating, setUpdating] = createSignal(false);
   const [appInfo, setAppInfo] = createSignal<AppInfo | null>(null);
   const [updatesAvailable, setUpdatesAvailable] = createSignal<number | null>(null);
   const [selected, setSelected] = createSignal<DiscoverItem | null>(null);
   const [discoverBusyKey, setDiscoverBusyKey] = createSignal<string | null>(null);
   const [nixAvailable, setNixAvailable] = createSignal(false);
+  const [hackerAvailable, setHackerAvailable] = createSignal<boolean | null>(null);
+  const [podmanAvailable, setPodmanAvailable] = createSignal<boolean | null>(null);
+  const [discoverSearchResults, setDiscoverSearchResults] = createSignal<DiscoverResult[]>([]);
+  const [discoverSearchLoading, setDiscoverSearchLoading] = createSignal(false);
 
   let searchInput: HTMLInputElement | undefined;
   let appliedDefault = false;
@@ -182,6 +190,8 @@ export default function App() {
 
     invoke<AppInfo>("get_app_info").then(setAppInfo).catch(() => {});
     invoke<boolean>("is_nix_available").then(setNixAvailable).catch(() => setNixAvailable(false));
+    invoke<boolean>("is_hacker_available").then(setHackerAvailable).catch(() => setHackerAvailable(false));
+    invoke<boolean>("is_podman_available").then(setPodmanAvailable).catch(() => setPodmanAvailable(false));
 
     // Resume anything still queued from before the app was last closed —
     // and restore the "installing…"/"removing…" spinner on whichever rows
@@ -206,6 +216,8 @@ export default function App() {
     { id: "game_launchers", label: t("nav.game_launchers"), icon: Gamepad2 },
     { id: "pentest_tools", label: t("nav.pentest_tools"), icon: Shield },
     { id: "drivers", label: t("nav.drivers"), icon: Cpu },
+    { id: "hackeros_ecosystem", label: t("nav.hackeros_ecosystem"), icon: Blocks },
+    { id: "dev_tools", label: t("nav.dev_tools"), icon: SquareTerminal },
     { id: "nix", label: t("nav.nix"), icon: Snowflake },
     { id: "update", label: t("nav.update"), icon: RefreshCw, badge: updatesAvailable() ?? undefined },
     { id: "history", label: t("nav.history"), icon: HistoryIcon },
@@ -294,6 +306,42 @@ export default function App() {
     );
   });
 
+  // ── Global search also covers Discover (apt/flatpak/snap/brew/hpm/nix/
+  // appimage) ──────────────────────────────────────────────────────────
+  // The curated `searchResults` memo above is instant/offline (it just
+  // filters an in-memory array), but it only ever covered the small
+  // curated catalogs. Discover's much bigger catalog lives behind a live
+  // backend query, so it needs its own debounced effect — same 420ms
+  // debounce DiscoverView's own search box uses, so a fast typist isn't
+  // firing a query per keystroke. Skipped while offline, since
+  // `discover_search` would just fail for every source anyway (the
+  // OfflineBanner already explains why).
+  let discoverSearchDebounce: ReturnType<typeof setTimeout> | undefined;
+  createEffect(() => {
+    const q = search().trim();
+    if (discoverSearchDebounce) clearTimeout(discoverSearchDebounce);
+    if (q.length < 2 || !online()) {
+      setDiscoverSearchResults([]);
+      setDiscoverSearchLoading(false);
+      return;
+    }
+    setDiscoverSearchLoading(true);
+    discoverSearchDebounce = setTimeout(async () => {
+      try {
+        const resp = await invoke<DiscoverResponse>("discover_search", { query: q });
+        // Stale-response guard: if the search box has moved on to a
+        // different query by the time this resolves, don't clobber
+        // newer/empty results with an outdated answer.
+        if (search().trim() === q) setDiscoverSearchResults(resp.results);
+      } catch {
+        if (search().trim() === q) setDiscoverSearchResults([]);
+      } finally {
+        if (search().trim() === q) setDiscoverSearchLoading(false);
+      }
+    }, 420);
+  });
+  onCleanup(() => { if (discoverSearchDebounce) clearTimeout(discoverSearchDebounce); });
+
   return (
     <div class="app">
       <Sidebar
@@ -311,6 +359,8 @@ export default function App() {
         onDequeue={queue.dequeue}
         onReorderQueue={queue.reorder}
         searchInputRef={el => (searchInput = el)}
+        theme={settingsApi.settings().theme}
+        onSetTheme={settingsApi.setTheme}
       />
 
       <main class="main">
@@ -323,7 +373,11 @@ export default function App() {
           fallback={
             <SearchResults results={searchResults()} query={search()}
               isInstalling={isInstalling} isUninstalling={isUninstalling} isInstalled={isInstalled}
-              getVersion={getVersion} onInstall={handleInstall} onUninstall={handleUninstall} />
+              getVersion={getVersion} onInstall={handleInstall} onUninstall={handleUninstall}
+              discoverResults={discoverSearchResults()} discoverLoading={discoverSearchLoading()}
+              isDiscoverInstalled={installedApi.isDiscoverInstalled} discoverBusyKey={discoverBusyKey()}
+              onDiscoverInstall={handleDiscoverInstall} onDiscoverUninstall={handleDiscoverUninstall}
+              onDiscoverOpen={setSelected} />
           }
         >
           <Show when={active() === "discover"}>
@@ -351,6 +405,17 @@ export default function App() {
               isInstalling={isInstalling} isUninstalling={isUninstalling} isInstalled={isInstalled}
               getVersion={getVersion} onInstall={handleInstall} onUninstall={handleUninstall} />
           </Show>
+          <Show when={active() === "hackeros_ecosystem"}>
+            <EcosystemView tag={ecosystemTag()} onTag={setEcosystemTag} hackerAvailable={hackerAvailable()}
+              isInstalling={isInstalling} isUninstalling={isUninstalling} isInstalled={isInstalled}
+              getVersion={getVersion} onInstall={handleInstall} onUninstall={handleUninstall} />
+          </Show>
+          <Show when={active() === "dev_tools"}>
+            <DevToolsView langTag={devToolsLangTag()} onLangTag={setDevToolsLangTag}
+              defaultMode={settingsApi.settings().dev_tools_default_mode} podmanAvailable={podmanAvailable()}
+              isInstalling={isInstalling} isUninstalling={isUninstalling} isInstalled={isInstalled}
+              getVersion={getVersion} onInstall={handleInstall} onUninstall={handleUninstall} />
+          </Show>
           <Show when={active() === "update"}>
             <UpdateView updating={updating()} onUpdate={handleUpdate}
               progress={runner.progress()} onShowLog={() => runner.setShowLog(true)}
@@ -366,6 +431,7 @@ export default function App() {
           <Show when={active() === "settings"}>
             <SettingsView settings={settingsApi.settings()} onSave={settingsApi.save}
               onClearCache={handleClearCache} onReset={settingsApi.reset} onBuildNixIndex={handleBuildNixIndex}
+              onExportSnapshot={settingsApi.exportSnapshot} onImportSnapshot={settingsApi.importSnapshot}
               busy={runner.busy()} appInfo={appInfo()} />
           </Show>
         </Show>
