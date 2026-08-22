@@ -1,6 +1,7 @@
 import { For } from "solid-js";
 import type { Package } from "../data/packages";
 import { PkgRow } from "./PkgRow";
+import { InstallAllButton } from "./InstallAllButton";
 
 export function PackageList(props: {
   title: string; packages: Package[];
@@ -13,7 +14,11 @@ export function PackageList(props: {
 }) {
   return (
     <div class="view">
-      <h1 class="view-title">{props.title}</h1>
+      <div class="view-header-row">
+        <h1 class="view-title">{props.title}</h1>
+        <InstallAllButton packages={props.packages} isInstalled={props.isInstalled}
+          isInstalling={props.isInstalling} onInstall={props.onInstall} />
+      </div>
       <div class="pkg-list">
         <For each={props.packages}>
           {pkg => (
