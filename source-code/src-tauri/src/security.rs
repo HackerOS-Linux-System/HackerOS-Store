@@ -41,6 +41,32 @@ pub fn validate_pkg_token(raw: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+/// Looser check for curated *display* names (game launchers, drivers,
+/// HackerOS Ecosystem tools) that are matched against a small, static Rust
+/// catalog (`match name { "NVIDIA Driver" => ..., ... }`) rather than
+/// interpolated into a shell command or used to build a filesystem path.
+/// Unlike [`validate_pkg_token`] this allows spaces and other punctuation
+/// (e.g. "Epic Games Store", "WiFi — Broadcom", "H# Utils") since those are
+/// real, legitimate catalog names — the actual safety backstop for these
+/// categories is that an unrecognised name simply fails the match arm and
+/// returns an "Unknown …" error, never reaching a shell. Still rejects the
+/// empty string, unreasonably long input, and raw control characters (which
+/// have no legitimate reason to appear in a display name and could otherwise
+/// do things like corrupt the terminal log).
+pub fn validate_display_name(raw: &str) -> Result<String, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("Empty package identifier.".to_string());
+    }
+    if s.len() > MAX_TOKEN_LEN {
+        return Err("Package identifier is unreasonably long.".to_string());
+    }
+    if s.chars().any(|c| c.is_control()) {
+        return Err("Package identifier must not contain control characters.".to_string());
+    }
+    Ok(s.to_string())
+}
+
 /// Validates a whole batch, short-circuiting on the first failure. Handy
 /// for the curated-section installers that operate on a small fixed list
 /// of package names at once.
@@ -90,5 +116,20 @@ mod tests {
     fn quoting_is_safe() {
         assert_eq!(sh_quote("firefox"), "'firefox'");
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn display_name_allows_spaces_and_punctuation() {
+        assert!(validate_display_name("NVIDIA Driver").is_ok());
+        assert!(validate_display_name("Epic Games Store").is_ok());
+        assert!(validate_display_name("WiFi — Broadcom").is_ok());
+        assert!(validate_display_name("H# Utils").is_ok());
+    }
+
+    #[test]
+    fn display_name_rejects_empty_and_control_chars() {
+        assert!(validate_display_name("").is_err());
+        assert!(validate_display_name("  ").is_err());
+        assert!(validate_display_name("foo\nbar").is_err());
     }
 }
