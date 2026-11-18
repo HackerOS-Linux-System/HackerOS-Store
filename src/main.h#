@@ -1,0 +1,254 @@
+use "bit -> silver" from "silver"
+use "std -> fs"      from "fs"
+use "std -> env"     from "env"
+use "std -> process" from "proc"
+use "std -> time"    from "time"
+mod jx
+mod shx
+mod cmds
+mod discover
+
+;; HackerOS Store — Silver (H# + TypeScript + Solid.js)
+;; Dwa tryby jednego pliku:
+;;   hackeros-store                       → okno
+;;   hackeros-store --worker CMD ARGS DIR → proces roboczy jednego polecenia (patrz job_start)
+
+fn jobs_dir() -> string is
+    return shx::home() + "/.cache/hackeros-store/jobs"
+end
+
+fn self_exe() -> string is
+    let r: string = string_trim(proc::run("readlink -f /proc/" + to_string(getpid()) + "/exe"))
+    return if r == "" then env::args()[0] else r
+end
+
+fn exe_dir() -> string is
+    let e: string = self_exe()
+    let i: int = string_rfind(e, "/")
+    return if i <= 0 then "." else string_slice(e, 0, i)
+end
+
+;; katalog z frontend/index.html: env, przodkowie pliku wykonywalnego (bit trzyma binarkę w cache/build/release), cwd, ścieżki systemowe
+fn has_frontend(d: string) -> bool is
+    return fs::exists(d + "/frontend/index.html")
+end
+
+fn find_root() -> string is
+    let envd: string = env::get("HACKEROS_STORE_ROOT")
+    if envd != "" && has_frontend(envd) is return envd end
+    let mut d: string = exe_dir()
+    let mut n: int = 0
+    while n < 8 is
+        if has_frontend(d) is return d end
+        let i: int = string_rfind(d, "/")
+        if i <= 0 is break end
+        d = string_slice(d, 0, i)
+        n += 1
+    end
+    let cwd: string = string_trim(proc::run("pwd"))
+    let mut c: string = cwd
+    n = 0
+    while n < 4 && c != "" is
+        if has_frontend(c) is return c end
+        let i2: int = string_rfind(c, "/")
+        if i2 <= 0 is break end
+        c = string_slice(c, 0, i2)
+        n += 1
+    end
+    let sys: [string] = ["/usr/share/hackeros-store", "/usr/lib/hackeros-store", "/opt/hackeros-store", "/usr/local/share/hackeros-store"]
+    let mut k: int = 0
+    while k < array_len(sys) is
+        if has_frontend(sys[k]) is return sys[k] end
+        k += 1
+    end
+    return exe_dir()
+end
+
+;; ── proces roboczy ──
+fn worker_main(cmd: string, args_file: string, dir: string) is
+    env::set("HOS_JOB_DIR", dir)
+    let args: string = if fs::exists(args_file) then fs::read(args_file) else "{{}}"
+    let r: shx::Res = cmds::dispatch(cmd, args)
+    let o = jx::ob()
+    jx::p_bool(o, "ok", r.ok)
+    if r.ok is
+        jx::p_raw(o, "value", if string_trim(r.val) == "" then "null" else r.val)
+    else is
+        jx::p_str(o, "error", r.err)
+    end
+    fs::write(dir + "/result.json.tmp", jx::ob_end(o))
+    fs::rename(dir + "/result.json.tmp", dir + "/result.json")
+end
+
+;; ── handlery okna ──
+fn cancellable(cmd: string) -> bool is
+    let names: [string] = ["install_package", "uninstall_package", "update_system", "discover_install", "discover_uninstall", "rollback_history_entry"]
+    let mut i: int = 0
+    while i < array_len(names) is
+        if names[i] == cmd is return true end
+        i += 1
+    end
+    return string_starts_with(cmd, "nix_")
+end
+
+fn h_job_start(args: string) -> string is
+    let cmd: string = jx::get_str(args, "cmd")
+    let a: string = jx::get_str(args, "args")
+    let id: string = to_string(time::now_ms()) + "-" + to_string(getpid())  + "-" + to_string(random_int(1000, 9999))
+    let dir: string = jobs_dir() + "/" + id
+    shx::mkdir_p(dir)
+    fs::write(dir + "/args.json", if a == "" then "{{}}" else a)
+    fs::write(dir + "/cmd", cmd)
+    let script: string = "echo $$ > " + shx::q(dir + "/pid") + "; exec " + shx::q(self_exe()) + " --worker " + shx::q(cmd) + " " + shx::q(dir + "/args.json") + " " + shx::q(dir) + " 2> " + shx::q(dir + "/err")
+    proc::spawn("( setsid -w sh -c " + shx::q(script) + " ; touch " + shx::q(dir + "/done") + " ) > /dev/null 2>&1")
+    let o = jx::ob()
+    jx::p_str(o, "id", id)
+    return jx::ob_end(o)
+end
+
+;; Silver (SDL_ttf + napisy H# bez GC) zatrzymuje pamięć przy przerysowaniach. Ostatnia deska ratunku przed
+;; zamrożeniem systemu: odświeżenie okna. Zasady (to naprawia samoczynne zamykanie/otwieranie i podwójne zamykanie):
+;;   * dopiero po przekroczeniu limitu (domyślnie 2048 MB, env HACKEROS_STORE_MEM_LIMIT_MB, 0 = wyłączone),
+;;   * tylko gdy użytkownik jest bezczynny (frontend raportuje `idle` w sekundach) — min. 45 s bez myszy/klawiatury,
+;;   * tylko gdy nie działa żadne zadanie (instalacja itp.),
+;;   * najwyżej jedno odświeżenie naraz (plik blokady), a skrypt NIE uruchamia nowej instancji, jeśli stara
+;;     została w międzyczasie zamknięta przez użytkownika (kill -0) — nic już nie „wraca" po zamknięciu okna.
+fn rss_mb() -> int is
+    let t: string = string_trim(proc::run("cut -d' ' -f2 /proc/" + to_string(getpid()) + "/statm"))
+    if t == "" is return 0 end
+    return str_to_int(t) * 4 / 1024
+end
+
+fn mem_limit_mb() -> int is
+    let e: string = string_trim(env::get("HACKEROS_STORE_MEM_LIMIT_MB"))
+    if e == "" is return 2048 end
+    return str_to_int(e)
+end
+
+fn jobs_active() -> bool is
+    let ids: [string] = fs::list_dir(jobs_dir())
+    let mut i: int = 0
+    while i < array_len(ids) is
+        let dir: string = jobs_dir() + "/" + path_basename_of(ids[i])
+        if fs::exists(dir + "/cmd") && !fs::exists(dir + "/done") is return true end
+        i += 1
+    end
+    return false
+end
+
+fn guard_memory(idle_s: int) is
+    let limit: int = mem_limit_mb()
+    if limit <= 0 || idle_s < 45 is return end
+    let lock: string = shx::home() + "/.cache/hackeros-store/restart.lock"
+    if fs::exists(lock) is return end
+    if rss_mb() <= limit is return end
+    if jobs_active() is return end
+    fs::write(lock, to_string(getpid()))
+    let me: string = to_string(getpid())
+    let relaunch: string = "sleep 1; if kill -0 " + me + " 2>/dev/null; then kill -TERM " + me + " 2>/dev/null; sleep 1; kill -KILL " + me + " 2>/dev/null; cd " + shx::q(find_root()) + " && rm -f " + shx::q(lock) + " && exec " + shx::q(self_exe()) + "; else rm -f " + shx::q(lock) + "; fi"
+    proc::spawn("setsid sh -c " + shx::q(relaunch) + " > /dev/null 2>&1")
+end
+
+fn h_job_poll(args: string) -> string is
+    let id: string = jx::get_str(args, "id")
+    if id == "" is
+        ;; puls ze strony frontendu (co 5 s): tylko sprawdza pamięć, nie dotyka katalogów zadań
+        guard_memory(jx::get_int(args, "idle"))
+        return "{{\"chunk\":\"\",\"offset\":0,\"done\":true,\"ok\":true}}"
+    end
+    let offset: int = jx::get_int(args, "offset")
+    let dir: string = jobs_dir() + "/" + id
+    let o = jx::ob()
+    if id == "" || string_contains(id, "/") || !fs::exists(dir) is
+        jx::p_str(o, "chunk", "")
+        jx::p_int(o, "offset", offset)
+        jx::p_bool(o, "done", true)
+        jx::p_bool(o, "ok", false)
+        jx::p_str(o, "error", "job not found")
+        return jx::ob_end(o)
+    end
+    let done: bool = fs::exists(dir + "/done")
+    let mut chunk: string = ""
+    let mut next: int = offset
+    if fs::exists(dir + "/events") && fs::size(dir + "/events") > offset is
+        let raw: string = proc::run_args("tail", ["-c", "+" + to_string(offset + 1), dir + "/events"])
+        let last: int = string_rfind(raw, "\n")
+        if last >= 0 is
+            chunk = string_slice(raw, 0, last + 1)
+            next = offset + last + 1
+        end
+    end
+    jx::p_str(o, "chunk", chunk)
+    jx::p_int(o, "offset", next)
+    jx::p_bool(o, "done", done)
+    if done is
+        let rf: string = dir + "/result.json"
+        if fs::exists(rf) is
+            let res: string = fs::read(rf)
+            jx::p_bool(o, "ok", jx::get_bool(res, "ok"))
+            if jx::get_bool(res, "ok") is
+                jx::p_raw(o, "value", jx::get_raw(res, "value"))
+            else is
+                jx::p_str(o, "error", jx::get_str(res, "error"))
+            end
+        else is
+            jx::p_bool(o, "ok", false)
+            let e: string = if fs::exists(dir + "/err") then string_trim(fs::read(dir + "/err")) else ""
+            jx::p_str(o, "error", if fs::exists(dir + "/cancel") then shx::CANCELLED_MSG else if e == "" then "worker exited without result" else e)
+        end
+        ;; wynik dostarczony — sprzątamy katalog zadania, o ile nie ma już nic do odebrania
+        if next >= (if fs::exists(dir + "/events") then fs::size(dir + "/events") else 0) is
+            proc::run_args("rm", ["-rf", dir])
+        end
+    end
+    return jx::ob_end(o)
+end
+
+fn h_cancel_install(args: string) -> string is
+    let ids: [string] = fs::list_dir(jobs_dir())
+    let mut i: int = 0
+    while i < array_len(ids) is
+        let dir: string = jobs_dir() + "/" + path_basename_of(ids[i])
+        if fs::exists(dir + "/cmd") && !fs::exists(dir + "/done") && cancellable(string_trim(fs::read(dir + "/cmd"))) is
+            fs::write(dir + "/cancel", "1")
+            if fs::exists(dir + "/pid") is
+                let pid: string = string_trim(fs::read(dir + "/pid"))
+                if pid != "" is
+                    proc::spawn("kill -TERM -- -" + pid + " 2>/dev/null; sleep 2; kill -KILL -- -" + pid + " 2>/dev/null")
+                end
+            end
+        end
+        i += 1
+    end
+    return "null"
+end
+
+fn path_basename_of(p: string) -> string is
+    let i: int = string_rfind(p, "/")
+    return if i < 0 then p else string_slice(p, i + 1, string_len(p))
+end
+
+fn main() is
+    let argv: [string] = env::args()
+    if array_len(argv) >= 5 && argv[1] == "--worker" is
+        worker_main(argv[2], argv[3], argv[4])
+        return
+    end
+    if array_len(argv) >= 4 && argv[1] == "--src" is
+        write(discover::src_json(argv[2], argv[3]))
+        return
+    end
+    fs_chdir(find_root())
+    proc::run_args("rm", ["-rf", jobs_dir()])
+    shx::mkdir_p(jobs_dir())
+    proc::run_args("rm", ["-f", shx::home() + "/.cache/hackeros-store/restart.lock"])
+    let mut a = app::new("HackerOS Store", 1100, 720)
+    a = app::set_min_size(a, 820, 560)
+    a = app::load_html(a, "frontend/index.html")
+    a = app::load_css(a, "frontend/dist/app.css")
+    a = app::command(a, "job_start", h_job_start)
+    a = app::command(a, "job_poll", h_job_poll)
+    a = app::command(a, "cancel_install", h_cancel_install)
+    a = app::load_js(a, ["frontend/dist/app.js"])
+    app::run(a)
+end
