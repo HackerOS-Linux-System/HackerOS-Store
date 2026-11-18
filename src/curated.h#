@@ -1,0 +1,852 @@
+use "std -> fs"   from "fs"
+use "std -> env"  from "env"
+use "std -> time" from "time"
+use "std -> process" from "proc"
+mod jx
+mod shx
+mod kv
+mod security
+mod settings
+mod pkgbackend
+
+;; ───────── drobne pomocnicze ─────────
+fn rv(r: shx::Res) -> shx::Res is return r end
+
+;; env_prefix dla shx::run_streaming_env: [("K","V"),...] -> "K='V' "
+fn envp(pairs: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i + 1 < array_len(pairs) is
+        out = out + pairs[i] + "=" + shx::q(pairs[i + 1]) + " "
+        i += 2
+    end
+    return out
+end
+
+fn first_word(s: string) -> string is
+    let t: string = string_trim(s)
+    let mut i: int = 0
+    while i < string_len(t) && byte_at(t, i) != 32 && byte_at(t, i) != 9 is i += 1 end
+    return string_slice(t, 0, i)
+end
+
+pub fn utf8_head(s: string, n: int) -> string is
+    let mut count: int = 0
+    let mut i: int = 0
+    let len: int = string_len(s)
+    while i < len is
+        if (byte_at(s, i) & 192) != 128 is
+            if count == n is return string_slice(s, 0, i) end
+            count += 1
+        end
+        i += 1
+    end
+    return s
+end
+
+pub fn apt_install(pkgs: [string]) -> shx::Res is
+    return pkgbackend::install(pkgs)
+end
+
+pub fn apt_remove(pkgs: [string]) -> shx::Res is
+    return pkgbackend::remove(pkgs)
+end
+
+;; ───────── Flatpak ─────────
+pub fn ensure_flatpak() -> shx::Res is
+    if !shx::has("flatpak") is
+        shx::emit_log("info", "Installing Flatpak...")
+        let r: shx::Res = apt_install(["flatpak"])
+        if !r.ok is return r end
+    end
+    let remotes: [settings::FlatpakRemote] = settings::current().flatpak_remotes
+    let mut i: int = 0
+    while i < array_len(remotes) is
+        let v: shx::Res = security::validate_pkg_token(remotes[i].name)
+        i += 1
+        if !v.ok is continue end
+        let name: string = v.val
+        shx::run_streaming(["flatpak", "remote-add", "--if-not-exists", "--user", name, remotes[i - 1].url])
+        shx::priv_run(["flatpak", "remote-add", "--if-not-exists", name, remotes[i - 1].url])
+    end
+    return shx::ok_unit()
+end
+
+pub fn flatpak_ref(id: string, branch: string) -> string is
+    if branch == "" || string_lower(branch) == "stable" is return id end
+    return id + "//" + branch
+end
+
+pub fn flatpak_install(id_in: string) -> shx::Res is
+    let v: shx::Res = security::validate_pkg_token(id_in)
+    if !v.ok is return v end
+    let id: string = v.val
+    let e: shx::Res = ensure_flatpak()
+    if !e.ok is return e end
+    let c: shx::Res = shx::check_cancel()
+    if !c.ok is return c end
+    let st: settings::Settings = settings::current()
+    let rvld: shx::Res = security::validate_pkg_token(st.flatpak_default_remote)
+    let remote: string = if rvld.ok then rvld.val else "flathub"
+    let ref_arg: string = flatpak_ref(id, st.flatpak_default_branch)
+    shx::emit_log("info", "Installing " + id + " from " + remote + "...")
+    shx::emit_prog("install", "Installing " + id + "...", 0.3)
+    let r: shx::Res = shx::run_streaming(["flatpak", "install", "-y", "--user", remote, ref_arg])
+    if !r.ok is
+        let c2: shx::Res = shx::check_cancel()
+        if !c2.ok is return c2 end
+        let p: shx::Res = shx::priv_run(["flatpak", "install", "-y", remote, ref_arg])
+        if !p.ok is return p end
+    end
+    shx::emit_prog("done", "Done!", 1.0)
+    shx::emit_log("success", "Installation complete.")
+    return shx::ok_unit()
+end
+
+pub fn flatpak_uninstall(id_in: string) -> shx::Res is
+    let v: shx::Res = security::validate_pkg_token(id_in)
+    if !v.ok is return v end
+    let id: string = v.val
+    shx::emit_log("info", "Removing " + id + "...")
+    shx::emit_prog("uninstall", "Removing " + id + "...", 0.3)
+    let r: shx::Res = shx::run_streaming(["flatpak", "uninstall", "-y", "--user", id])
+    if !r.ok is
+        let c: shx::Res = shx::check_cancel()
+        if !c.ok is return c end
+        let p: shx::Res = shx::priv_run(["flatpak", "uninstall", "-y", id])
+        if !p.ok is return p end
+    end
+    shx::emit_prog("done", "Removed.", 1.0)
+    shx::emit_log("success", "Removed successfully.")
+    return shx::ok_unit()
+end
+
+fn colon_rest(line: string) -> string is
+    ;; line.split(':').nth(1) — tekst między 1. a 2. dwukropkiem, przycięty
+    let parts: [string] = str_split(line, ":")
+    if array_len(parts) < 2 is return "" end
+    return string_trim(parts[1])
+end
+
+;; JSON {"size": str|null, "version": str|null}
+pub fn flatpak_remote_info(id: string) -> string is
+    let mut version: string = ""
+    let mut size: string = ""
+    if id != "" is
+        let vr: shx::Res = security::validate_pkg_token(settings::current().flatpak_default_remote)
+        let remote: string = if vr.ok then vr.val else "flathub"
+        let o: shx::Out = shx::run_timeout(["flatpak", "remote-info", "--user", remote, id], 6)
+        if o.spawned && !o.timed_out is
+            let lines: [string] = shx::lines_of(o.stdout)
+            let mut i: int = 0
+            while i < array_len(lines) is
+                let l: string = lines[i]
+                i += 1
+                if string_contains(l, "Version:") is version = colon_rest(l) end
+                if string_contains(l, "Download Size:") || string_contains(l, "Installed Size:") is size = colon_rest(l) end
+            end
+        end
+    end
+    let r = jx::ob()
+    jx::p_opt(r, "size", size, id != "" && size != "" || (id != "" && false))
+    jx::p_opt(r, "version", version, id != "" && version != "" || (id != "" && false))
+    return jx::ob_end(r)
+end
+
+;; "" = None
+pub fn flatpak_current_commit(id: string) -> string is
+    let scopes: [[string]] = [["info", "--user", id], ["info", id]]
+    let mut s: int = 0
+    while s < 2 is
+        let o: shx::Out = shx::run_timeout(array_concat(["flatpak"], scopes[s]), 5)
+        s += 1
+        if o.spawned && !o.timed_out is
+            let lines: [string] = shx::lines_of(o.stdout)
+            let mut i: int = 0
+            while i < array_len(lines) is
+                let t: string = string_trim(lines[i])
+                i += 1
+                if string_starts_with(t, "Commit:") is
+                    let c: string = string_trim(string_slice(t, 7, string_len(t)))
+                    if c != "" is return c end
+                end
+            end
+        end
+    end
+    return ""
+end
+
+pub fn flatpak_rollback_to_commit(id_in: string, commit_in: string) -> shx::Res is
+    let v: shx::Res = security::validate_pkg_token(id_in)
+    if !v.ok is return v end
+    let v2: shx::Res = security::validate_pkg_token(commit_in)
+    if !v2.ok is return v2 end
+    let id: string = v.val
+    let commit: string = v2.val
+    let arg: string = "--commit=" + commit
+    shx::emit_log("info", "Pinning " + id + " to commit " + utf8_head(commit, 12) + "...")
+    let r: shx::Res = shx::run_streaming(["flatpak", "update", "-y", "--user", arg, id])
+    if !r.ok is
+        let p: shx::Res = shx::priv_run(["flatpak", "update", "-y", arg, id])
+        if !p.ok is return p end
+    end
+    return shx::ok_unit()
+end
+
+;; ───────── Wine ─────────
+pub fn ensure_wine() -> shx::Res is
+    if !shx::has("wine") is
+        shx::emit_log("info", "Wine not found — installing...")
+        let a: shx::Res = pkgbackend::add_foreign_arch("i386")
+        if !a.ok is return a end
+        let u: shx::Res = pkgbackend::update_index()
+        if !u.ok is return u end
+        return apt_install(["wine", "wine32", "wine64", "winetricks", "libgl1"])
+    end
+    if pkgbackend::installed_version("wine32") == "" is
+        shx::emit_log("info", "wine32 not found — installing...")
+        let a2: shx::Res = pkgbackend::add_foreign_arch("i386")
+        if !a2.ok is return a2 end
+        let u2: shx::Res = pkgbackend::update_index()
+        if !u2.ok is return u2 end
+        let i: shx::Res = apt_install(["wine32", "libgl1"])
+        if !i.ok is
+            return shx::fail("Failed to install wine32. Please run manually:\n  sudo dpkg --add-architecture i386\n  sudo apt-get update\n  sudo apt-get install wine32\n(or, on a hammer-based system: sudo hammer dpkg-arch add i386 && sudo hammer sync && sudo hammer install wine32)")
+        end
+    end
+    return shx::ok_unit()
+end
+
+pub fn verify_download(id: string, path: string) -> shx::Res is
+    let o: shx::Out = shx::run(["sha256sum", path])
+    if !o.spawned is return shx::fail("sha256sum failed: not found") end
+    let digest: string = first_word(o.stdout)
+    if digest == "" is
+        shx::emit_log("stderr", "Could not compute a checksum for the downloaded installer.")
+        return shx::ok_unit()
+    end
+    shx::emit_log("info", "Downloaded installer SHA-256: " + digest)
+    shx::emit_log("stderr", "No pinned checksum is configured for this installer (the vendor does not publish stable hashes). Proceeding, but you may want to verify this binary yourself before trusting it.")
+    return shx::ok_unit()
+end
+
+;; ───────── Non-free ─────────
+fn codename() -> string is
+    let o: shx::Out = shx::run(["lsb_release", "-sc"])
+    let t: string = string_trim(o.stdout)
+    return if o.spawned && o.code == 0 && t != "" then t else "trixie"
+end
+
+pub fn ensure_nonfree() -> shx::Res is
+    if pkgbackend::backend() == "apt" is return ensure_nonfree_apt() end
+    return ensure_nonfree_hammer()
+end
+
+fn ensure_nonfree_apt() -> shx::Res is
+    let g: shx::Out = shx::run_sh("grep -r non-free /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | grep -v '#' | grep -q non-free && echo yes", 0)
+    if string_trim(g.stdout) == "yes" is return shx::ok_unit() end
+    let cn: string = codename()
+    let mirror: string = settings::current().apt_mirror
+    let host: string = if string_trim(mirror) == "" then "deb.debian.org" else mirror
+    let line: string = "deb http://" + host + "/debian " + cn + " main contrib non-free non-free-firmware\n"
+    shx::emit_log("info", "Adding non-free repositories for '" + cn + "'...")
+    let tmp: string = env::temp_dir() + "/hackeros-nonfree-" + to_string(getpid()) + ".list"
+    if !shx::write_file(tmp, line) is return shx::fail("Failed writing temp sources file: " + tmp) end
+    let r: shx::Res = shx::priv_run(["install", "-m", "0644", tmp, "/etc/apt/sources.list.d/hackeros-nonfree.list"])
+    fs::remove(tmp)
+    if !r.ok is return r end
+    return shx::priv_run(["apt-get", "update", "-qq"])
+end
+
+fn ensure_nonfree_hammer() -> shx::Res is
+    if pkgbackend::hammer_mode() == "oci" is
+        shx::emit_log("info", "hammer oci mode: non-free components come from the base image's own build-time sources, not something the Store can add live — skipping.")
+        return shx::ok_unit()
+    end
+    let bin: string = pkgbackend::hammer_bin_pub()
+    if bin == "" is return shx::fail("hammer is not installed on this system.") end
+    let l: shx::Out = shx::run([bin, "repo", "list"])
+    if string_contains(l.stdout, "non-free") is return shx::ok_unit() end
+    let cn: string = codename()
+    let mirror: string = settings::current().apt_mirror
+    let host: string = if string_trim(mirror) == "" then "deb.debian.org" else mirror
+    let uri: string = "http://" + host + "/debian"
+    shx::emit_log("info", "Adding non-free repositories for '" + cn + "' via hammer...")
+    let r: shx::Res = shx::priv_run([bin, "repo", "add", uri, cn, "main", "contrib", "non-free", "non-free-firmware"])
+    if !r.ok is return r end
+    return pkgbackend::update_index()
+end
+
+;; ───────── Distrobox / Kali ─────────
+pub fn ensure_distrobox() -> shx::Res is
+    if shx::has("distrobox") is return shx::ok_unit() end
+    shx::emit_log("info", "Installing distrobox...")
+    return apt_install(["distrobox"])
+end
+
+pub fn kali_exists() -> bool is
+    let o: shx::Out = shx::run(["distrobox", "list"])
+    return o.spawned && string_contains(o.stdout, "kali-pentest")
+end
+
+pub fn ensure_kali() -> shx::Res is
+    if kali_exists() is return shx::ok_unit() end
+    shx::emit_log("info", "Creating Kali Linux container (first run ~5 min)...")
+    shx::emit_prog("install", "Creating Kali container...", 0.15)
+    let r: shx::Res = shx::run_streaming(["distrobox", "create", "--image", "kalilinux/kali-rolling", "--name", "kali-pentest", "--yes"])
+    if !r.ok is return r end
+    shx::run_streaming(["distrobox", "enter", "kali-pentest", "--", "sudo", "apt-get", "update", "-qq"])
+    return shx::ok_unit()
+end
+
+;; ───────── Katalogi (generowane z lib.rs) ─────────
+fn pentest_names_all() -> [string] is
+    return ["nmap", "masscan", "arp-scan", "netdiscover", "hping3", "netcat", "ncat", "socat", "rustscan", "naabu", "wireshark", "tcpdump", "tshark", "tcpflow", "scapy", "fping", "zmap", "unicornscan", "dnsenum", "fierce", "p0f", "dmitry", "nbtscan", "burpsuite", "zaproxy", "sqlmap", "nikto", "gobuster", "wpscan", "beef-xss", "feroxbuster", "ffuf", "nuclei", "httpx", "katana", "dirb", "dirsearch", "whatweb", "wafw00f", "commix", "xsser", "joomscan", "droopescan", "sslyze", "testssl.sh", "wfuzz", "wapiti", "skipfish", "xsstrike", "dalfox", "john", "hydra", "hashcat", "medusa", "crunch", "cewl", "patator", "ncrack", "hashid", "ophcrack", "fcrackzip", "pdfcrack", "rarcrack", "bruteforce-luks", "aircrack-ng", "kismet", "reaver", "wifite", "cowpatty", "pixiewps", "hcxdumptool", "hcxtools", "bully", "mdk4", "fern-wifi-cracker", "bettercap", "responder", "ettercap", "sslstrip", "mitmproxy", "dsniff", "dnschef", "yersinia", "macchanger", "tcpreplay", "netsniff-ng", "metasploit", "impacket", "crackmapexec", "evil-winrm", "bloodhound", "enum4linux", "smbclient", "ldap-utils", "smbmap", "theharvester", "maltego", "recon-ng", "dnsrecon", "subfinder", "amass", "sherlock", "spiderfoot", "exiftool", "whois", "gitleaks", "h8mail", "proxychains", "tor", "chisel", "stunnel", "sshuttle", "iodine", "sslscan", "openvas", "trivy", "volatility", "autopsy", "binwalk", "foremost", "steghide", "radare2", "ghidra", "gdb", "yara", "clamav", "mat2", "testdisk", "photorec", "sleuthkit", "bulk-extractor", "hexedit", "upx", "apktool", "jadx", "lynis", "rkhunter", "chkrootkit"]
+end
+fn pentest_deb_flags() -> [bool] is
+    return [true, true, true, true, true, true, true, true, false, false, true, true, true, true, true, true, true, false, false, false, true, false, true, false, true, true, true, true, false, false, false, false, false, false, false, true, false, true, true, false, true, false, false, true, true, false, true, false, false, false, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false, false, true, false, true, true, false, true, true, true, true, false, true, false, false, false, true, true, true, false, true, false, true, true, false, true, false, false, true, true, false, false, true, true, false, true, true, true, true, false, false, true, true, true, true, true, true, false, true, true, true, true, true, true, true, true, true, true, false, false, true, true, true]
+end
+fn apt_override_keys() -> [string] is
+    return ["exiftool", "impacket", "scapy", "stunnel", "photorec", "upx"]
+end
+fn apt_override_vals() -> [string] is
+    return ["libimage-exiftool-perl", "python3-impacket", "python3-scapy", "stunnel4", "testdisk", "upx-ucl"]
+end
+fn dev_locals() -> [string] is
+    return ["Rust (cargo) — Local", "Node.js (npm) — Local", "Python (pip) — Local", "Go — Local", "Java (JDK) — Local", "Ruby (gem) — Local", "PHP — Local", "C/C++ (build-essential) — Local"]
+end
+fn dev_containers() -> [string] is
+    return ["Rust (cargo) — Container", "Node.js (npm) — Container", "Python (pip) — Container", "Go — Container", "Java (JDK) — Container", "Ruby (gem) — Container", "PHP — Container", "C/C++ (build-essential) — Container"]
+end
+fn dev_pkgs() -> [string] is
+    return ["cargo", "npm", "python3-pip", "golang-go", "default-jdk", "ruby-full", "php-cli", "build-essential"]
+end
+fn dev_bins() -> [string] is
+    return ["cargo", "npm", "pip3", "go", "javac", "gem", "php", "gcc"]
+end
+fn eco_names() -> [string] is
+    return ["HackerOS TV", "Add-ons", "GS", "Dev Tools", "Emulators", "Cybersecurity", "Gaming", "Gaming — Roblox", "Hacker Mode", "Automatic Updates", "Alacritty Config", "Winboat", "NVIDIA Drivers", "HackerOS Containers", "H#", "H# Utils", "HackerOS Builder", "Isolator", "Hydra", "Hammer", "HackerOS Games", "HexAi", "HackerDeck", "Blue Environment", "HWDE", "Cybersecurity Mode", "SDE"]
+end
+fn eco_slugs() -> [string] is
+    return ["hackeros-tv", "add-ons", "gs", "devtools", "emulators", "cybersecurity", "gaming", "gaming-roblox", "hacker-mode", "automatic-updates", "alacritty-config", "winboat", "nvidia-drivers", "hackeros-containers", "h#", "h#-utils", "hackeros-builder", "isolator", "hydra", "hammer", "hackeros-games", "hexai", "hackerdeck", "blue-environment", "hwde", "cybersecurity-mode", "sde"]
+end
+fn eco_removable() -> [bool] is
+    return [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, false, true, true, true, true, true, true, true, true]
+end
+
+fn idx_of(xs: [string], v: string) -> int is
+    let mut i: int = 0
+    while i < array_len(xs) is
+        if xs[i] == v is return i end
+        i += 1
+    end
+    return -1
+end
+
+pub fn apt_pkg_name(tool: string) -> string is
+    let i: int = idx_of(apt_override_keys(), tool)
+    if i >= 0 is return apt_override_vals()[i] end
+    return tool
+end
+
+pub fn in_debian(name: string) -> bool is
+    let i: int = idx_of(pentest_names_all(), name)
+    if i < 0 is return false end
+    return pentest_deb_flags()[i]
+end
+
+pub fn pentest_tool_names() -> [string] is return pentest_names_all() end
+
+pub struct DevEntry is
+    pub found: bool
+    pub local: string
+    pub container: string
+    pub pkg: string
+    pub bin: string
+    pub is_container: bool
+end
+
+pub fn dev_tool_entry(name: string) -> DevEntry is
+    let l: int = idx_of(dev_locals(), name)
+    let c: int = idx_of(dev_containers(), name)
+    let i: int = if l >= 0 then l else c
+    if i < 0 is
+        return DevEntry { found: false, local: "", container: "", pkg: "", bin: "", is_container: false }
+    end
+    return DevEntry { found: true, local: dev_locals()[i], container: dev_containers()[i], pkg: dev_pkgs()[i], bin: dev_bins()[i], is_container: l < 0 }
+end
+
+pub fn driver_pkgs(name: string) -> [string] is
+    if name == "NVIDIA Driver" is return ["nvidia-driver", "firmware-misc-nonfree"] end
+    if name == "AMD Driver" is return ["firmware-amd-graphics", "libgl1-mesa-dri", "xserver-xorg-video-amdgpu"] end
+    if name == "Intel Driver" is return ["firmware-misc-nonfree", "intel-media-va-driver", "i965-va-driver", "libva-drm2"] end
+    if name == "WiFi — Broadcom" is return ["broadcom-sta-dkms", "dkms", "linux-headers-amd64"] end
+    if name == "WiFi — Realtek" is return ["rtl8812au-dkms", "dkms", "linux-headers-amd64"] end
+    if name == "Firmware (non-free)" is return ["firmware-linux-nonfree", "firmware-misc-nonfree", "firmware-realtek", "firmware-iwlwifi", "firmware-atheros"] end
+    return []
+end
+
+pub fn launcher_flatpak_id(name: string) -> string is
+    if name == "Steam" is return "com.valvesoftware.Steam" end
+    if name == "Lutris" is return "net.lutris.Lutris" end
+    if name == "Heroic" || name == "Epic Games Store" is return "com.heroicgameslauncher.hgl" end
+    if name == "Bottles" is return "com.usebottles.bottles" end
+    return ""
+end
+
+;; ───────── Launchers ─────────
+pub fn install_launcher(name: string) -> shx::Res is
+    let id: string = launcher_flatpak_id(name)
+    if id != "" is return flatpak_install(id) end
+    if name == "GOG" || name == "Battle.net" || name == "EA App" is return install_wine_launcher(name) end
+    return shx::fail("Unknown launcher: " + name)
+end
+
+pub fn uninstall_launcher(name: string) -> shx::Res is
+    let id: string = launcher_flatpak_id(name)
+    if id != "" is return flatpak_uninstall(id) end
+    if name == "GOG" || name == "Battle.net" || name == "EA App" is return uninstall_wine_launcher(name) end
+    return shx::fail("Unknown launcher: " + name)
+end
+
+;; (id, url, exe)
+fn wine_launcher_meta(name: string) -> [string] is
+    if name == "GOG" is
+        return ["gog", "https://webinstallers.gog.com/galaxy_installer_en.exe", "GOG Galaxy/GalaxyClient.exe"]
+    end
+    if name == "Battle.net" is
+        return ["battlenet", "https://www.battle.net/download/getInstaller?os=win&installer=Battle.net-Setup.exe", "Battle.net/Battle.net.exe"]
+    end
+    return ["ea", "https://origin-a.akamaihd.net/EA-Desktop-Client-Download/installer-releases/EAappInstaller.exe", "Electronic Arts/EA Desktop/EADesktop.exe"]
+end
+
+fn install_wine_launcher(name: string) -> shx::Res is
+    let w: shx::Res = ensure_wine()
+    if !w.ok is return w end
+    let c: shx::Res = shx::check_cancel()
+    if !c.ok is return c end
+    let meta: [string] = wine_launcher_meta(name)
+    let id: string = meta[0]
+    let url: string = meta[1]
+    let exe: string = meta[2]
+    let home: string = shx::home()
+    let dir: string = home + "/.hackeros/launchers/" + id
+    let prefix: string = dir + "/prefix"
+    shx::mkdir_p(prefix)
+    let installer: string = dir + "/installer.exe"
+    shx::emit_log("info", "Downloading " + name + " installer...")
+    shx::emit_prog("download", "Downloading " + name + "...", 0.1)
+    let d: shx::Res = shx::run_streaming(["wget", "-q", "-O", installer, url])
+    if !d.ok is return d end
+    let c2: shx::Res = shx::check_cancel()
+    if !c2.ok is return c2 end
+    let v: shx::Res = verify_download(id, installer)
+    if !v.ok is return v end
+    let env: string = "WINEPREFIX=" + shx::q(prefix) + " WINEARCH=win32 WINEDEBUG=-all "
+    shx::emit_log("info", "Initialising Wine prefix (win32)...")
+    shx::emit_prog("wine", "Initialising Wine prefix...", 0.40)
+    let b: shx::Res = shx::run_streaming_env(["wineboot", "--init"], env)
+    if !b.ok is return b end
+    let c3: shx::Res = shx::check_cancel()
+    if !c3.ok is return c3 end
+    shx::emit_log("info", "Running " + name + " installer via Wine...")
+    shx::emit_prog("wine", "Installing " + name + "...", 0.65)
+    let r: shx::Res = shx::run_streaming_env(["wine", installer, "/S"], env)
+    if !r.ok is return r end
+    let ddir: string = home + "/.local/share/applications"
+    shx::mkdir_p(ddir)
+    let exe_path: string = prefix + "/drive_c/Program Files (x86)/" + exe
+    let desktop: string = "[Desktop Entry]\nName=" + name + "\nExec=env WINEPREFIX=" + prefix + " WINEARCH=win32 WINEDEBUG=-all wine \"" + exe_path + "\"\nType=Application\nCategories=Game;\n"
+    fs::write(ddir + "/" + id + ".desktop", desktop)
+    shx::emit_prog("done", "Done!", 1.0)
+    return shx::ok_unit()
+end
+
+fn uninstall_wine_launcher(name: string) -> shx::Res is
+    let meta: [string] = wine_launcher_meta(name)
+    let id: string = meta[0]
+    let home: string = shx::home()
+    let dir: string = home + "/.hackeros/launchers/" + id
+    shx::emit_prog("uninstall", "Removing " + name + "...", 0.3)
+    shx::emit_log("info", "Deleting Wine prefix and files for " + name + "...")
+    shx::run(["rm", "-rf", dir])
+    fs::remove(home + "/.local/share/applications/" + id + ".desktop")
+    shx::emit_prog("done", "Removed.", 1.0)
+    return shx::ok_unit()
+end
+
+;; ───────── Pentest ─────────
+pub fn install_pentest(name_in: string) -> shx::Res is
+    let v: shx::Res = security::validate_pkg_token(name_in)
+    if !v.ok is return v end
+    let name: string = v.val
+    if in_debian(name) is
+        let pkg: string = apt_pkg_name(name)
+        shx::emit_log("info", "Installing " + name + " from Debian repos...")
+        shx::emit_prog("install", "Installing " + name + "...", 0.2)
+        let r: shx::Res = apt_install([pkg])
+        if !r.ok is return r end
+    else
+        let a: shx::Res = ensure_distrobox()
+        if !a.ok is return a end
+        let c1: shx::Res = shx::check_cancel()
+        if !c1.ok is return c1 end
+        let k: shx::Res = ensure_kali()
+        if !k.ok is return k end
+        let c2: shx::Res = shx::check_cancel()
+        if !c2.ok is return c2 end
+        shx::emit_log("info", "Installing " + name + " in Kali container...")
+        shx::emit_prog("install", "Installing " + name + " in Kali...", 0.5)
+        let r2: shx::Res = shx::run_streaming(["distrobox", "enter", "kali-pentest", "--", "sudo", "apt-get", "install", "-y", name])
+        if !r2.ok is return r2 end
+        let home: string = shx::home()
+        let bin: string = home + "/.local/bin"
+        shx::mkdir_p(bin)
+        let w: string = bin + "/" + name
+        fs::write(w, "#!/bin/sh\ndistrobox enter kali-pentest -- " + name + " \"$@\"\n")
+        shx::run(["chmod", "755", w])
+        let ddir: string = home + "/.local/share/applications"
+        shx::mkdir_p(ddir)
+        fs::write(ddir + "/" + name + ".desktop", "[Desktop Entry]\nName=" + name + "\nExec=" + w + "\nType=Application\nCategories=Security;\n")
+    end
+    shx::emit_prog("done", "Done!", 1.0)
+    return shx::ok_unit()
+end
+
+pub fn uninstall_pentest(name_in: string) -> shx::Res is
+    let v: shx::Res = security::validate_pkg_token(name_in)
+    if !v.ok is return v end
+    let name: string = v.val
+    if in_debian(name) is
+        let pkg: string = apt_pkg_name(name)
+        shx::emit_log("info", "Removing " + name + " (apt)...")
+        shx::emit_prog("uninstall", "Removing " + name + "...", 0.3)
+        let r: shx::Res = apt_remove([pkg])
+        if !r.ok is return r end
+    else
+        shx::emit_log("info", "Removing " + name + " from Kali container...")
+        shx::emit_prog("uninstall", "Removing " + name + "...", 0.3)
+        if kali_exists() is
+            shx::run_streaming(["distrobox", "enter", "kali-pentest", "--", "sudo", "apt-get", "remove", "-y", name])
+        end
+        let home: string = shx::home()
+        fs::remove(home + "/.local/bin/" + name)
+        fs::remove(home + "/.local/share/applications/" + name + ".desktop")
+    end
+    shx::emit_prog("done", "Removed.", 1.0)
+    return shx::ok_unit()
+end
+
+;; ───────── Dev tools ─────────
+const PODMAN_ENV: string = "DBX_CONTAINER_MANAGER=podman "
+
+pub fn ensure_podman() -> shx::Res is
+    if shx::has("podman") is return shx::ok_unit() end
+    shx::emit_log("info", "Installing podman...")
+    return apt_install(["podman"])
+end
+
+pub fn devbox_exists() -> bool is
+    let o: shx::Out = shx::run_env(PODMAN_ENV, ["distrobox", "list"], 0)
+    return o.spawned && string_contains(o.stdout, "hackeros-devbox")
+end
+
+pub fn ensure_devbox() -> shx::Res is
+    if devbox_exists() is return shx::ok_unit() end
+    shx::emit_log("info", "Creating the HackerOS Dev Tools container (Podman, first run ~2-3 min)...")
+    shx::emit_prog("install", "Creating dev tools container...", 0.15)
+    let r: shx::Res = shx::run_streaming_env(["distrobox", "create", "--image", "debian:trixie-slim", "--name", "hackeros-devbox", "--yes"], PODMAN_ENV)
+    if !r.ok is return r end
+    shx::run_streaming_env(["distrobox", "enter", "hackeros-devbox", "--", "sudo", "apt-get", "update", "-qq"], PODMAN_ENV)
+    return shx::ok_unit()
+end
+
+pub fn install_dev_tool(name_in: string) -> shx::Res is
+    let v: shx::Res = security::validate_display_name(name_in)
+    if !v.ok is return v end
+    let name: string = v.val
+    let e: DevEntry = dev_tool_entry(name)
+    if !e.found is return shx::fail("Unknown Dev Tools entry: " + name) end
+    if !e.is_container is
+        shx::emit_log("info", "Installing " + name + " from Debian repos...")
+        shx::emit_prog("install", "Installing " + name + "...", 0.2)
+        let r: shx::Res = apt_install([e.pkg])
+        if !r.ok is return r end
+    else
+        let a: shx::Res = ensure_podman()
+        if !a.ok is return a end
+        let c1: shx::Res = shx::check_cancel()
+        if !c1.ok is return c1 end
+        let b: shx::Res = ensure_distrobox()
+        if !b.ok is return b end
+        let c2: shx::Res = shx::check_cancel()
+        if !c2.ok is return c2 end
+        let d: shx::Res = ensure_devbox()
+        if !d.ok is return d end
+        let c3: shx::Res = shx::check_cancel()
+        if !c3.ok is return c3 end
+        shx::emit_log("info", "Installing " + name + " in the dev tools container...")
+        shx::emit_prog("install", "Installing " + name + " in container...", 0.6)
+        let r2: shx::Res = shx::run_streaming_env(["distrobox", "enter", "hackeros-devbox", "--", "sudo", "apt-get", "install", "-y", e.pkg], PODMAN_ENV)
+        if !r2.ok is return r2 end
+        let bindir: string = shx::home() + "/.local/bin"
+        shx::mkdir_p(bindir)
+        let w: string = bindir + "/" + e.bin
+        fs::write(w, "#!/bin/sh\nDBX_CONTAINER_MANAGER=podman distrobox enter hackeros-devbox -- " + e.bin + " \"$@\"\n")
+        shx::run(["chmod", "755", w])
+    end
+    shx::emit_prog("done", "Done!", 1.0)
+    return shx::ok_unit()
+end
+
+pub fn uninstall_dev_tool(name_in: string) -> shx::Res is
+    let v: shx::Res = security::validate_display_name(name_in)
+    if !v.ok is return v end
+    let name: string = v.val
+    let e: DevEntry = dev_tool_entry(name)
+    if !e.found is return shx::fail("Unknown Dev Tools entry: " + name) end
+    if !e.is_container is
+        shx::emit_log("info", "Removing " + name + " (apt)...")
+        shx::emit_prog("uninstall", "Removing " + name + "...", 0.3)
+        let r: shx::Res = apt_remove([e.pkg])
+        if !r.ok is return r end
+    else
+        shx::emit_log("info", "Removing " + name + " from the dev tools container...")
+        shx::emit_prog("uninstall", "Removing " + name + "...", 0.3)
+        if devbox_exists() is
+            shx::run_streaming_env(["distrobox", "enter", "hackeros-devbox", "--", "sudo", "apt-get", "remove", "-y", e.pkg], PODMAN_ENV)
+        end
+        fs::remove(shx::home() + "/.local/bin/" + e.bin)
+    end
+    shx::emit_prog("done", "Removed.", 1.0)
+    return shx::ok_unit()
+end
+
+;; ───────── Drivers ─────────
+pub fn install_driver(name: string) -> shx::Res is
+    let pkgs: [string] = driver_pkgs(name)
+    if array_len(pkgs) == 0 is return shx::fail("Unknown driver: " + name) end
+    let n: shx::Res = ensure_nonfree()
+    if !n.ok is return n end
+    let c: shx::Res = shx::check_cancel()
+    if !c.ok is return c end
+    shx::emit_log("info", "Installing " + name + "...")
+    shx::emit_prog("install", "Installing " + name + "...", 0.3)
+    let r: shx::Res = apt_install(pkgs)
+    if !r.ok is return r end
+    shx::emit_prog("done", "Done!", 1.0)
+    return shx::ok_unit()
+end
+
+pub fn uninstall_driver(name: string) -> shx::Res is
+    let pkgs: [string] = driver_pkgs(name)
+    if array_len(pkgs) == 0 is return shx::fail("Unknown driver: " + name) end
+    shx::emit_log("info", "Removing " + name + "...")
+    shx::emit_prog("uninstall", "Removing " + name + "...", 0.3)
+    let r: shx::Res = apt_remove(pkgs)
+    if !r.ok is return r end
+    shx::emit_prog("done", "Removed.", 1.0)
+    return shx::ok_unit()
+end
+
+;; ───────── HackerOS Ecosystem ─────────
+pub fn hackeros_ecosystem_marker_dir() -> string is
+    return shx::home() + "/.hackeros/ecosystem"
+end
+
+pub fn install_hackeros_tool(name: string) -> shx::Res is
+    let i: int = idx_of(eco_names(), name)
+    if i < 0 is return shx::fail("Unknown HackerOS Ecosystem tool: " + name) end
+    let slug: string = eco_slugs()[i]
+    shx::emit_log("info", "Unpacking " + name + " (`hacker unpack " + slug + "`)...")
+    shx::emit_prog("install", "Installing " + name + "...", 0.2)
+    let r: shx::Res = shx::run_streaming(["hacker", "unpack", slug])
+    if !r.ok is return r end
+    let dir: string = hackeros_ecosystem_marker_dir()
+    shx::mkdir_p(dir)
+    fs::write(dir + "/" + slug, to_string(time::now_ms() / 1000))
+    shx::emit_prog("done", "Done!", 1.0)
+    return shx::ok_unit()
+end
+
+pub fn uninstall_hackeros_tool(name: string) -> shx::Res is
+    let i: int = idx_of(eco_names(), name)
+    if i < 0 is return shx::fail("Unknown HackerOS Ecosystem tool: " + name) end
+    let slug: string = eco_slugs()[i]
+    if !eco_removable()[i] is
+        return shx::fail(name + " cannot be removed via `hacker pack` — this is a one-way install.")
+    end
+    shx::emit_log("info", "Packing " + name + " (`hacker pack " + slug + "`)...")
+    shx::emit_prog("uninstall", "Removing " + name + "...", 0.3)
+    let r: shx::Res = shx::run_streaming(["hacker", "pack", slug])
+    if !r.ok is return r end
+    fs::remove(hackeros_ecosystem_marker_dir() + "/" + slug)
+    shx::emit_prog("done", "Removed.", 1.0)
+    return shx::ok_unit()
+end
+
+;; ───────── check_all_installed ─────────
+fn state_obj(key: string, installed: bool, version: string) -> string is
+    let o = jx::ob()
+    jx::p_str(o, "key", key)
+    jx::p_bool(o, "installed", installed)
+    jx::p_opt(o, "version", version, version != "")
+    return jx::ob_end(o)
+end
+
+;; Mapa "bin:yes|no" z batch-probe w kontenerze -> Kv
+fn probe_container(container: string, env: string, bins: [string]) -> kv::Kv is
+    let script: string = "for t in " + iter_join(bins, " ") + "; do command -v \"$t\" >/dev/null 2>&1 && echo \"$t:yes\" || echo \"$t:no\"; done"
+    let o: shx::Out = shx::run_env(env, ["distrobox", "enter", container, "--", "sh", "-c", script], 6)
+    let mut keys: [string] = []
+    let mut vals: [string] = []
+    if o.spawned && !o.timed_out is
+        let lines: [string] = shx::lines_of(o.stdout)
+        let mut i: int = 0
+        while i < array_len(lines) is
+            let l: string = lines[i]
+            i += 1
+            let p: int = string_find(l, ":")
+            if p > 0 is
+                keys = array_push(keys, string_slice(l, 0, p))
+                vals = array_push(vals, string_slice(l, p + 1, string_len(l)))
+            end
+        end
+    end
+    return kv::from_pairs(keys, vals)
+end
+
+pub fn check_all_installed() -> string is
+    let mut items: [string] = []
+    ;; Flatpak
+    let fo: shx::Out = shx::run(["flatpak", "list", "--columns=application,version"])
+    let fl: [string] = shx::lines_of(fo.stdout)
+    let mut fk: [string] = []
+    let mut fv: [string] = []
+    let mut i: int = 0
+    while i < array_len(fl) is
+        let l: string = fl[i]
+        i += 1
+        let p: int = string_find(l, "\t")
+        let id: string = string_trim(if p >= 0 then string_slice(l, 0, p) else l)
+        let ver: string = if p >= 0 then string_trim(string_slice(l, p + 1, string_len(l))) else ""
+        if id != "" is
+            fk = array_push(fk, id)
+            fv = array_push(fv, ver)
+        end
+    end
+    let fp: kv::Kv = kv::from_pairs(fk, fv)
+    let fkeys: [string] = ["game_launchers::Steam", "game_launchers::Lutris", "game_launchers::Heroic", "game_launchers::Epic Games Store", "game_launchers::Bottles"]
+    let fids: [string] = ["com.valvesoftware.Steam", "net.lutris.Lutris", "com.heroicgameslauncher.hgl", "com.heroicgameslauncher.hgl", "com.usebottles.bottles"]
+    i = 0
+    while i < array_len(fkeys) is
+        items = array_push(items, state_obj(fkeys[i], kv::has(fp, fids[i]), kv::get(fp, fids[i])))
+        i += 1
+    end
+    ;; apt / hammer
+    let apt: kv::Kv = pkgbackend::installed_map()
+    let names: [string] = pentest_tool_names()
+    let mut container_tools: [string] = []
+    i = 0
+    while i < array_len(names) is
+        let n: string = names[i]
+        i += 1
+        if in_debian(n) is
+            let pkg: string = apt_pkg_name(n)
+            items = array_push(items, state_obj("pentest_tools::" + n, kv::has(apt, pkg), kv::get(apt, pkg)))
+        else
+            container_tools = array_push(container_tools, n)
+        end
+    end
+    let mut kali: kv::Kv = kv::empty()
+    if kali_exists() is kali = probe_container("kali-pentest", "", container_tools) end
+    i = 0
+    while i < array_len(container_tools) is
+        let n2: string = container_tools[i]
+        i += 1
+        items = array_push(items, state_obj("pentest_tools::" + n2, kv::get(kali, n2) == "yes", ""))
+    end
+    let dkeys: [string] = ["drivers::NVIDIA Driver", "drivers::AMD Driver", "drivers::Intel Driver", "drivers::WiFi — Broadcom", "drivers::WiFi — Realtek", "drivers::Firmware (non-free)"]
+    let dpkgs: [string] = ["nvidia-driver", "firmware-amd-graphics", "intel-media-va-driver", "broadcom-sta-dkms", "rtl8812au-dkms", "firmware-linux-nonfree"]
+    i = 0
+    while i < array_len(dkeys) is
+        items = array_push(items, state_obj(dkeys[i], kv::has(apt, dpkgs[i]), kv::get(apt, dpkgs[i])))
+        i += 1
+    end
+    ;; Ecosystem
+    let md: string = hackeros_ecosystem_marker_dir()
+    let en: [string] = eco_names()
+    let es: [string] = eco_slugs()
+    i = 0
+    while i < array_len(en) is
+        items = array_push(items, state_obj("hackeros_ecosystem::" + en[i], fs::exists(md + "/" + es[i]), ""))
+        i += 1
+    end
+    ;; Dev tools local
+    let dl: [string] = dev_locals()
+    let dp: [string] = dev_pkgs()
+    i = 0
+    while i < array_len(dl) is
+        items = array_push(items, state_obj("dev_tools::" + dl[i], kv::has(apt, dp[i]), kv::get(apt, dp[i])))
+        i += 1
+    end
+    ;; Dev tools container
+    let mut dev: kv::Kv = kv::empty()
+    if devbox_exists() is dev = probe_container("hackeros-devbox", PODMAN_ENV, dev_bins()) end
+    let dc: [string] = dev_containers()
+    let db: [string] = dev_bins()
+    i = 0
+    while i < array_len(dc) is
+        items = array_push(items, state_obj("dev_tools::" + dc[i], kv::get(dev, db[i]) == "yes", ""))
+        i += 1
+    end
+    return jx::arr_raw(items)
+end
+
+;; ───────── get_package_info ─────────
+fn note_obj(note: string) -> string is
+    let o = jx::ob()
+    jx::p_null(o, "size")
+    jx::p_null(o, "version")
+    jx::p_str(o, "note", note)
+    return jx::ob_end(o)
+end
+
+pub fn get_package_info(name_in: string, category: string) -> string is
+    let v: shx::Res = security::validate_display_name(name_in)
+    if !v.ok is return note_obj(v.err) end
+    let name: string = v.val
+    if category == "game_launchers" is
+        let id: string = launcher_flatpak_id(name)
+        if id != "" is return flatpak_remote_info(id) end
+        return note_obj("Downloaded via Wine — size known only after install.")
+    end
+    if category == "pentest_tools" is
+        if in_debian(name) is
+            let pv: shx::Res = security::validate_pkg_token(apt_pkg_name(name))
+            if !pv.ok is return note_obj(pv.err) end
+            return pkgbackend::show_info(pv.val)
+        end
+        return note_obj("Installed inside the Kali container — size not tracked by apt.")
+    end
+    if category == "drivers" is
+        let pk: [string] = driver_pkgs(name)
+        if array_len(pk) == 0 is return note_obj("Unknown driver: " + name) end
+        return pkgbackend::show_info(pk[0])
+    end
+    if category == "hackeros_ecosystem" is
+        return note_obj("Managed by the `hacker` CLI (unpack/pack) — size and version aren't tracked here.")
+    end
+    if category == "dev_tools" is
+        let e: DevEntry = dev_tool_entry(name)
+        if !e.found is return note_obj("Unknown Dev Tools entry: " + name) end
+        if e.is_container is
+            return note_obj("Installed inside the hackeros-devbox Podman container — size not tracked by apt on the host.")
+        end
+        return pkgbackend::show_info(e.pkg)
+    end
+    let o = jx::ob()
+    jx::p_null(o, "size")
+    jx::p_null(o, "version")
+    return jx::ob_end(o)
+end
