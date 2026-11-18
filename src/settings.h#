@@ -1,0 +1,211 @@
+use "std -> fs" from "fs"
+use "std -> time" from "time"
+mod jx
+mod shx
+mod jpretty
+
+pub struct FlatpakRemote is
+    pub name: string
+    pub url:  string
+end
+
+pub struct Settings is
+    pub language:                 string
+    pub flatpak_remotes:          [FlatpakRemote]
+    pub flatpak_default_remote:   string
+    pub flatpak_default_branch:   string
+    pub flatpak_remote_url:       string
+    pub apt_mirror:               string
+    pub check_updates_on_startup: bool
+    pub enabled_sources:          [string]
+    pub snap_default_channel:     string
+    pub ratings_enabled:          bool
+    pub default_section:          string
+    pub theme:                    string
+    pub dev_tools_default_mode:   string
+end
+
+const DEFAULT_REMOTE_URL: string = "https://dl.flathub.org/repo/flathub.flatpakrepo"
+
+pub fn settings_path() -> string is
+    return shx::home() + "/.hackeros/store/settings.json"
+end
+
+fn default_remotes() -> [FlatpakRemote] is
+    return [FlatpakRemote { name: "flathub", url: DEFAULT_REMOTE_URL }]
+end
+
+pub fn defaults() -> Settings is
+    return Settings {
+        language: "en",
+        flatpak_remotes: default_remotes(),
+        flatpak_default_remote: "flathub",
+        flatpak_default_branch: "",
+        flatpak_remote_url: DEFAULT_REMOTE_URL,
+        apt_mirror: "",
+        check_updates_on_startup: true,
+        enabled_sources: ["apt", "flatpak", "snap", "brew", "hpm"],
+        snap_default_channel: "stable",
+        ratings_enabled: true,
+        default_section: "discover",
+        theme: "dark",
+        dev_tools_default_mode: "ask"
+    }
+end
+
+;; Settings -> raw JSON object (field order as in the Rust struct)
+pub fn to_json(s: Settings) -> string is
+    let mut rem: [string] = []
+    let mut i: int = 0
+    while i < array_len(s.flatpak_remotes) is
+        let r = jx::ob()
+        jx::p_str(r, "name", s.flatpak_remotes[i].name)
+        jx::p_str(r, "url", s.flatpak_remotes[i].url)
+        rem = array_push(rem, jx::ob_end(r))
+        i += 1
+    end
+    let o = jx::ob()
+    jx::p_str(o, "language", s.language)
+    jx::p_raw(o, "flatpak_remotes", jx::arr_raw(rem))
+    jx::p_str(o, "flatpak_default_remote", s.flatpak_default_remote)
+    jx::p_str(o, "flatpak_default_branch", s.flatpak_default_branch)
+    jx::p_str(o, "flatpak_remote_url", s.flatpak_remote_url)
+    jx::p_str(o, "apt_mirror", s.apt_mirror)
+    jx::p_bool(o, "check_updates_on_startup", s.check_updates_on_startup)
+    jx::p_strs(o, "enabled_sources", s.enabled_sources)
+    jx::p_str(o, "snap_default_channel", s.snap_default_channel)
+    jx::p_bool(o, "ratings_enabled", s.ratings_enabled)
+    jx::p_str(o, "default_section", s.default_section)
+    jx::p_str(o, "theme", s.theme)
+    jx::p_str(o, "dev_tools_default_mode", s.dev_tools_default_mode)
+    return jx::ob_end(o)
+end
+
+;; raw JSON object -> Settings; absent/null keys take serde defaults. No migration here.
+pub fn from_json(raw: string) -> Settings is
+    let d: Settings = defaults()
+    let mut remotes: [FlatpakRemote] = d.flatpak_remotes
+    let rr: string = jx::get_raw(raw, "flatpak_remotes")
+    if !jx::raw_is_null(rr) is
+        remotes = []
+        let items: [string] = jx::array_items(rr)
+        let mut i: int = 0
+        while i < array_len(items) is
+            remotes = array_push(remotes, FlatpakRemote { name: jx::get_str(items[i], "name"), url: jx::get_str(items[i], "url") })
+            i += 1
+        end
+    end
+    let mut sources: [string] = d.enabled_sources
+    if !jx::raw_is_null(jx::get_raw(raw, "enabled_sources")) is
+        sources = jx::get_strs(raw, "enabled_sources")
+    end
+    return Settings {
+        language: jx::get_str_or(raw, "language", d.language),
+        flatpak_remotes: remotes,
+        flatpak_default_remote: jx::get_str_or(raw, "flatpak_default_remote", d.flatpak_default_remote),
+        flatpak_default_branch: jx::get_str_or(raw, "flatpak_default_branch", d.flatpak_default_branch),
+        flatpak_remote_url: jx::get_str_or(raw, "flatpak_remote_url", d.flatpak_remote_url),
+        apt_mirror: jx::get_str_or(raw, "apt_mirror", d.apt_mirror),
+        check_updates_on_startup: jx::get_bool_or(raw, "check_updates_on_startup", d.check_updates_on_startup),
+        enabled_sources: sources,
+        snap_default_channel: jx::get_str_or(raw, "snap_default_channel", d.snap_default_channel),
+        ratings_enabled: jx::get_bool_or(raw, "ratings_enabled", d.ratings_enabled),
+        default_section: jx::get_str_or(raw, "default_section", d.default_section),
+        theme: jx::get_str_or(raw, "theme", d.theme),
+        dev_tools_default_mode: jx::get_str_or(raw, "dev_tools_default_mode", d.dev_tools_default_mode)
+    }
+end
+
+fn is_obj(t: string) -> bool is
+    return string_starts_with(t, "{") && string_ends_with(t, "}")
+end
+
+;; lib.rs current_settings (with flatpak_remote_url -> flatpak_remotes migration)
+pub fn current() -> Settings is
+    let mut s: Settings = defaults()
+    let p: string = settings_path()
+    if fs::exists(p) is
+        let t: string = string_trim(fs::read(p))
+        if is_obj(t) is s = from_json(t) end
+    end
+    if array_len(s.flatpak_remotes) == 0 is
+        s.flatpak_remotes = [FlatpakRemote { name: "flathub", url: s.flatpak_remote_url }]
+    end
+    return s
+end
+
+fn write_settings(s: Settings) -> shx::Res is
+    let p: string = settings_path()
+    shx::mkdir_p(shx::home() + "/.hackeros/store")
+    if !shx::write_file(p, jpretty::pretty(to_json(s))) is
+        return shx::fail("Failed to write " + p)
+    end
+    return shx::ok("null")
+end
+
+pub fn default_settings_backup_path() -> string is
+    return shx::home() + "/hackeros-store-settings.json"
+end
+
+;; Rust expand_home_path: trim, leading "~/" -> $HOME, empty -> default backup path
+pub fn expand_home_path(path: string) -> string is
+    let p: string = string_trim(path)
+    if string_starts_with(p, "~/") is
+        return shx::home() + "/" + string_slice(p, 2, string_len(p))
+    end
+    if p == "" is return default_settings_backup_path() end
+    return p
+end
+
+;; Cheap epoch-seconds timestamp (ecosystem marker files)
+pub fn chrono_now_string() -> string is
+    return to_string(time::now_unix())
+end
+
+pub fn cmd_get_settings(args: string) -> shx::Res is
+    return shx::ok(to_json(current()))
+end
+
+pub fn cmd_save_settings(args: string) -> shx::Res is
+    let raw: string = jx::get_raw(args, "settings")
+    if !is_obj(string_trim(raw)) is
+        return shx::fail("invalid args: missing field `settings`")
+    end
+    return write_settings(from_json(raw))
+end
+
+pub fn cmd_reset_settings(args: string) -> shx::Res is
+    fs::remove(settings_path())
+    return shx::ok(to_json(defaults()))
+end
+
+fn dirname_of(p: string) -> string is
+    let i: int = string_rfind(p, "/")
+    if i <= 0 is return "" end
+    return string_slice(p, 0, i)
+end
+
+pub fn cmd_export_settings_snapshot(args: string) -> shx::Res is
+    let dest: string = expand_home_path(jx::get_str(args, "path"))
+    let d: string = dirname_of(dest)
+    if d != "" is shx::mkdir_p(d) end
+    if !shx::write_file(dest, jpretty::pretty(to_json(current()))) is
+        return shx::fail("Permission denied (os error 13)")
+    end
+    return shx::ok(jx::quote(dest))
+end
+
+pub fn cmd_import_settings_snapshot(args: string) -> shx::Res is
+    let src: string = expand_home_path(jx::get_str(args, "path"))
+    if !fs::is_file(src) is
+        return shx::fail("Couldn't read " + src + ": No such file or directory (os error 2)")
+    end
+    let t: string = string_trim(fs::read(src))
+    if !is_obj(t) is
+        return shx::fail("That doesn't look like a HackerOS Store settings file: expected value at line 1 column 1")
+    end
+    let s: Settings = from_json(t)
+    let r: shx::Res = write_settings(s)
+    if !r.ok is return r end
+    return shx::ok(to_json(s))
+end
