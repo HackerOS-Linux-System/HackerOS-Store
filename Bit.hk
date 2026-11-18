@@ -1,0 +1,33 @@
+[package]
+-> name        => hackeros-store
+-> version     => 0.8.1
+-> description => HackerOS Store — H# / Silver / TypeScript / Solid.js
+-> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
+-> license     => BSD-3
+-> lang        => h#
+
+[layout]
+-> src => src
+
+[build]
+-> link => static
+
+[dependencies]
+-> silver => newest
+
+[default-build]
+-> profile => release
+-> target  => h#
+-> emit    => bin
+-> run     => true
+
+[hooks]
+-> pre-build => cd frontend && npm install --no-audit --no-fund && npm run build
+
+[commands]
+-> frontend
+--> run => cd frontend && npm install --no-audit --no-fund && npm run build
+--> description => Zbuduj frontend (TypeScript/Solid → frontend/dist/app.js + app.css)
+-> watch
+--> run => cd frontend && npm run watch
+--> description => Buduj frontend przy każdej zmianie
