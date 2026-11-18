@@ -1,0 +1,297 @@
+use "std -> fs" from "fs"
+use "std -> time" from "time"
+mod jx
+mod shx
+mod security
+mod jpretty
+mod pkgbackend
+mod hpm
+mod hnm
+mod appimage
+mod curated
+
+pub struct PackageVersion is
+    pub name:    string
+    pub version: string
+end
+
+const MAX_HISTORY_ENTRIES: int = 500
+
+fn history_path() -> string is
+    return shx::home() + "/.hackeros/store/history.json"
+end
+
+;; raw JSON array of entries (oldest first); "[]" when missing/corrupt
+fn load() -> string is
+    let p: string = history_path()
+    if !fs::exists(p) is return "[]" end
+    let t: string = string_trim(fs::read(p))
+    if string_starts_with(t, "[") && string_ends_with(t, "]") is return t end
+    return "[]"
+end
+
+fn save(arr: string) -> shx::Res is
+    shx::mkdir_p(shx::home() + "/.hackeros/store")
+    let p: string = history_path()
+    if !shx::write_file(p, jpretty::pretty(arr)) is
+        return shx::fail("Failed to write " + p)
+    end
+    return shx::ok("null")
+end
+
+fn now_iso() -> string is
+    return "epoch:" + to_string(time::now_unix())
+end
+
+fn new_id() -> string is
+    let o: shx::Out = shx::run(["date", "+%s%N"])
+    let t: string = string_trim(o.stdout)
+    if o.spawned && o.code == 0 && string_len(t) > 10 is return "h" + t end
+    return "h" + to_string(time::now_ms()) + "000000"
+end
+
+fn packages_json(packages: [PackageVersion]) -> string is
+    let mut items: [string] = []
+    let mut i: int = 0
+    while i < array_len(packages) is
+        let o = jx::ob()
+        jx::p_str(o, "name", packages[i].name)
+        jx::p_str(o, "version", packages[i].version)
+        items = array_push(items, jx::ob_end(o))
+        i += 1
+    end
+    return jx::arr_raw(items)
+end
+
+fn push_entry(action: string, source: string, name: string, package_id: string, version: string,
+              packages: [PackageVersion], commit: string, nix_generation: int,
+              success: bool, message: string) -> shx::Res is
+    let o = jx::ob()
+    jx::p_str(o, "id", new_id())
+    jx::p_str(o, "timestamp", now_iso())
+    jx::p_str(o, "action", action)
+    jx::p_str(o, "source", source)
+    jx::p_str(o, "name", name)
+    jx::p_str(o, "package_id", package_id)
+    jx::p_opt(o, "version", version, version != "")
+    if array_len(packages) > 0 is
+        jx::p_raw(o, "packages", packages_json(packages))
+    else is
+        jx::p_null(o, "packages")
+    end
+    jx::p_bool(o, "success", success)
+    jx::p_opt(o, "message", message, message != "")
+    jx::p_opt(o, "commit", commit, commit != "")
+    if nix_generation >= 0 is
+        jx::p_int(o, "nix_generation", nix_generation)
+    else is
+        jx::p_null(o, "nix_generation")
+    end
+    let entry: string = jx::ob_end(o)
+
+    let mut items: [string] = jx::array_items(load())
+    items = array_push(items, entry)
+    if array_len(items) > MAX_HISTORY_ENTRIES is
+        let drop: int = array_len(items) - MAX_HISTORY_ENTRIES
+        let mut kept: [string] = []
+        let mut i: int = drop
+        while i < array_len(items) is
+            kept = array_push(kept, items[i])
+            i += 1
+        end
+        items = kept
+    end
+    return save(jx::arr_raw(items))
+end
+
+pub fn record(action: string, source: string, name: string, package_id: string, version: string, success: bool, message: string) -> shx::Res is
+    return push_entry(action, source, name, package_id, version, [], "", -1, success, message)
+end
+
+pub fn record_multi(action: string, source: string, name: string, package_id: string, version: string, packages: [PackageVersion], success: bool, message: string) -> shx::Res is
+    return push_entry(action, source, name, package_id, version, packages, "", -1, success, message)
+end
+
+pub fn record_with_commit(action: string, source: string, name: string, package_id: string, version: string, commit: string, success: bool, message: string) -> shx::Res is
+    return push_entry(action, source, name, package_id, version, [], commit, -1, success, message)
+end
+
+;; nix_generation: -1 = None
+pub fn record_with_generation(action: string, source: string, name: string, package_id: string, version: string, nix_generation: int, success: bool, message: string) -> shx::Res is
+    return push_entry(action, source, name, package_id, version, [], "", nix_generation, success, message)
+end
+
+;; raw JSON array, most recent first
+pub fn get_all() -> string is
+    let items: [string] = jx::array_items(load())
+    let mut rev: [string] = []
+    let mut i: int = array_len(items) - 1
+    while i >= 0 is
+        rev = array_push(rev, items[i])
+        i -= 1
+    end
+    return jx::arr_raw(rev)
+end
+
+pub fn clear() -> shx::Res is
+    return save("[]")
+end
+
+fn find_entry(entry_id: string) -> string is
+    let items: [string] = jx::array_items(load())
+    let mut i: int = 0
+    while i < array_len(items) is
+        if jx::get_str(items[i], "id") == entry_id is return items[i] end
+        i += 1
+    end
+    return ""
+end
+
+;; Ok(msg) -> shx::ok(msg) (plain text, NOT JSON-quoted; cmd_rollback_history_entry quotes it)
+pub fn rollback_entry(entry_id: string) -> shx::Res is
+    let entry: string = find_entry(entry_id)
+    if entry == "" is return shx::fail("History entry not found.") end
+    let source: string = jx::get_str(entry, "source")
+    let name: string = jx::get_str(entry, "name")
+    let package_id: string = jx::get_str(entry, "package_id")
+    let action: string = jx::get_str(entry, "action")
+
+    if source != "apt" is
+        if source == "hpm" is
+            return hpm::rollback(package_id)
+        elsif source == "nix" is
+            let graw: string = jx::get_raw(entry, "nix_generation")
+            if jx::raw_is_null(graw) is
+                return shx::fail("Rollback isn't available for this Nix entry — no generation number was recorded at install/remove time (it predates generation tracking). Open the Nix panel to roll back to a specific generation directly instead.")
+            end
+            let generation: int = str_to_int(jx::raw_to_str(graw))
+            let r: shx::Res = hnm::rollback(generation)
+            if !r.ok is return r end
+            let msg: string = r.val + " Note: this reverts the *entire* Nix profile to right after '" + name + "' — every nix/hnm package's state at that point, not just this one — the same way `hnm rollback` itself works (it has no per-package undo)."
+            record_with_generation("rollback", "nix", name, package_id, "", generation, true, msg)
+            return shx::ok(msg)
+        elsif source == "appimage" is
+            return appimage::rollback(package_id)
+        elsif source == "flatpak" is
+            let commit: string = jx::get_str(entry, "commit")
+            if commit == "" is
+                return shx::fail("Rollback isn't available for this Flatpak entry — no commit was recorded at install time (it predates commit tracking, or the `flatpak info` lookup failed right after install). Re-install it once to enable rollback for future updates.")
+            end
+            let r: shx::Res = curated::flatpak_rollback_to_commit(package_id, commit)
+            if !r.ok is return r end
+            let short: string = if string_len(commit) > 12 then string_slice(commit, 0, 12) else commit
+            let msg: string = "Rolled " + name + " back to commit " + short + "."
+            record_with_commit("rollback", "flatpak", name, package_id, "", commit, true, msg)
+            return shx::ok(msg)
+        elsif source == "hackeros_ecosystem" is
+            let mut msg: string = ""
+            if action == "install" is
+                let r: shx::Res = curated::uninstall_hackeros_tool(name)
+                if !r.ok is return r end
+                msg = "Rolled back: packed " + name + " back up (`hacker pack`)."
+            elsif action == "uninstall" is
+                let r: shx::Res = curated::install_hackeros_tool(name)
+                if !r.ok is return r end
+                msg = "Rolled back: unpacked " + name + " again (`hacker unpack`)."
+            else is
+                return shx::fail("Rollback isn't supported for a recorded '" + action + "' HackerOS Ecosystem action.")
+            end
+            record("rollback", "hackeros_ecosystem", name, package_id, "", true, msg)
+            return shx::ok(msg)
+        elsif source == "dev_tools_container" is
+            let mut msg: string = ""
+            if action == "install" is
+                let r: shx::Res = curated::uninstall_dev_tool(name)
+                if !r.ok is return r end
+                msg = "Rolled back: removed " + name + " (container)."
+            elsif action == "uninstall" is
+                let r: shx::Res = curated::install_dev_tool(name)
+                if !r.ok is return r end
+                msg = "Rolled back: reinstalled " + name + " (container)."
+            else is
+                return shx::fail("Rollback isn't supported for a recorded '" + action + "' Dev Tools action.")
+            end
+            record("rollback", "dev_tools_container", name, package_id, "", true, msg)
+            return shx::ok(msg)
+        end
+        return shx::fail("Rollback isn't supported for source '" + source + "' — no pinned version/revision is tracked for it.")
+    end
+
+    ;; apt: multi-package entry (drivers)
+    let praw: string = jx::get_raw(entry, "packages")
+    if !jx::raw_is_null(praw) is
+        let pitems: [string] = jx::array_items(praw)
+        if array_len(pitems) == 0 is
+            return shx::fail("No package versions were recorded for this action, so it can't be rolled back.")
+        end
+        let mut pvs: [PackageVersion] = []
+        let mut i: int = 0
+        while i < array_len(pitems) is
+            let pn: string = jx::get_str(pitems[i], "name")
+            let pv: string = jx::get_str(pitems[i], "version")
+            pvs = array_push(pvs, PackageVersion { name: pn, version: pv })
+            let pkg: shx::Res = security::validate_pkg_token(pn)
+            if !pkg.ok is return pkg end
+            let ver: shx::Res = security::validate_pkg_token(pv)
+            if !ver.ok is return ver end
+            let d: shx::Res = pkgbackend::downgrade_to(pkg.val, ver.val)
+            if !d.ok is
+                return shx::fail("Rollback stopped at '" + pn + "': " + d.err)
+            end
+            i += 1
+        end
+        let mut parts: [string] = []
+        let mut k: int = 0
+        while k < array_len(pvs) is
+            parts = array_push(parts, pvs[k].name + "=" + pvs[k].version)
+            k += 1
+        end
+        let msg: string = "Rolled " + name + " back to its previously recorded versions (" + iter_join(parts, ", ") + ")."
+        record_multi("rollback", "apt", name, package_id, "", pvs, true, msg)
+        return shx::ok(msg)
+    end
+
+    let version0: string = jx::get_str(entry, "version")
+    if version0 == "" is
+        return shx::fail("No version was recorded for this action, so it can't be rolled back.")
+    end
+    let pkg: shx::Res = security::validate_pkg_token(package_id)
+    if !pkg.ok is return pkg end
+    let ver: shx::Res = security::validate_pkg_token(version0)
+    if !ver.ok is return ver end
+    let d: shx::Res = pkgbackend::downgrade_to(pkg.val, ver.val)
+    if !d.ok is return d end
+    let msg: string = "Rolled " + name + " back to version " + ver.val + "."
+    record("rollback", "apt", name, pkg.val, ver.val, true, msg)
+    return shx::ok(msg)
+end
+
+;; "" = None
+pub fn current_apt_version(package_id: string) -> string is
+    return pkgbackend::installed_version(package_id)
+end
+
+pub fn current_apt_versions(package_ids: [string]) -> [PackageVersion] is
+    let src: [pkgbackend::PkgVer] = pkgbackend::installed_versions(package_ids)
+    let mut out: [PackageVersion] = []
+    let mut i: int = 0
+    while i < array_len(src) is
+        out = array_push(out, PackageVersion { name: src[i].name, version: src[i].version })
+        i += 1
+    end
+    return out
+end
+
+pub fn cmd_get_install_history(args: string) -> shx::Res is
+    return shx::ok(get_all())
+end
+
+pub fn cmd_clear_install_history(args: string) -> shx::Res is
+    return clear()
+end
+
+pub fn cmd_rollback_history_entry(args: string) -> shx::Res is
+    let r: shx::Res = rollback_entry(jx::get_str(args, "entryId"))
+    if !r.ok is return r end
+    return shx::ok(jx::quote(r.val))
+end
