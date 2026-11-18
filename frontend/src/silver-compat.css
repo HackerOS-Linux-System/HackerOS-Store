@@ -1,0 +1,31 @@
+*{box-sizing:border-box;margin:0;padding:0}
+input,button,textarea,select{box-sizing:border-box}
+svg{stroke:currentColor}
+.nav-item{white-space:nowrap}
+/* pozycjonowanie ikon w polach wyszukiwania: stałe px zamiast top:50% + translateY(-50%) */
+.search-icon{top:8px;transform:none;margin:0}
+.discover-search-icon{top:13px;transform:none;margin:0}
+.search-clear{top:5px;transform:none;margin:0}
+.search-icon,.discover-search-icon{fill:none}
+/* Silver podwaja lewy margines elementów rozciąganych w kolumnie flex — stałe wymiary */
+.search-wrap{align-self:flex-start;width:199px;margin:12px 0 8px 10px}
+.theme-toggle{align-self:flex-start;width:203px;margin:0 0 8px 8px}
+button{background-color:transparent}
+button:focus{outline:none}
+.btn-info{background-color:transparent;color:var(--text3)}
+.btn-info:hover{background-color:var(--bg4);color:var(--text)}
+svg{flex-shrink:0}
+svg{fill:none}
+svg.star-filled{fill:currentColor}
+.view-title{white-space:nowrap}
+html,body{height:100%}
+.main{min-height:0}
+.app{position:fixed;top:0;left:0;right:0;bottom:0;height:auto;width:auto}
+.main{height:100vh}
+.view-title{display:flex;align-items:center}
+.pkg-row-name{white-space:nowrap}
+.app-card-actions{justify-content:flex-start;align-items:center;gap:6px}
+.app-card-actions>*:first-child{margin-left:auto}
+.app-card-actions .install-done-wrap{flex-shrink:0;width:127px}
+.modal-overlay{top:0;left:0;right:0;bottom:0}
+.modal-overlay{height:100vh;width:100vw}
