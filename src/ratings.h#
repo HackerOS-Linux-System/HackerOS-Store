@@ -1,0 +1,121 @@
+use "std -> fs" from "fs"
+use "std -> time" from "time"
+mod jx
+mod shx
+mod security
+mod jpretty
+
+const MAX_REVIEWS_PER_PACKAGE: int = 50
+
+fn ratings_path() -> string is
+    return shx::home() + "/.hackeros/store/ratings.json"
+end
+
+;; whole file as a raw JSON object ("{}" when missing/corrupt)
+fn load() -> string is
+    let p: string = ratings_path()
+    if !fs::exists(p) is return "{}" end
+    let t: string = string_trim(fs::read(p))
+    if string_starts_with(t, "{") && string_ends_with(t, "}") is return t end
+    return "{}"
+end
+
+fn key(source: string, package_id: string) -> string is
+    return source + ":" + package_id
+end
+
+fn now_iso() -> string is
+    return "epoch:" + to_string(time::now_unix())
+end
+
+;; raw review items -> {"average":..,"count":..} (average as f64)
+fn aggregate(items: [string]) -> string is
+    let count: int = array_len(items)
+    let mut sum: int = 0
+    let mut i: int = 0
+    while i < count is
+        sum += jx::get_int(items[i], "stars")
+        i += 1
+    end
+    let o = jx::ob()
+    jx::p_raw(o, "average", to_string((sum + 0.0) / (count + 0.0)))
+    jx::p_int(o, "count", count)
+    return jx::ob_end(o)
+end
+
+;; Option<RatingInfo> as raw JSON ("null" when none). Used by discover (AppDetails.local_rating).
+pub fn local_rating_json(source: string, package_id: string) -> string is
+    let v: shx::Res = security::validate_pkg_token(package_id)
+    if !v.ok is return "null" end
+    let store: string = load()
+    let items: [string] = jx::array_items(jx::get_raw(store, key(source, v.val)))
+    if array_len(items) == 0 is return "null" end
+    return aggregate(items)
+end
+
+pub fn submit_rating(source: string, package_id: string, stars: int, comment: string, has_comment: bool) -> shx::Res is
+    let v: shx::Res = security::validate_pkg_token(package_id)
+    if !v.ok is return v end
+    if stars < 1 || stars > 5 is
+        return shx::fail("Rating must be between 1 and 5 stars.")
+    end
+    let mut c: string = ""
+    if has_comment is
+        c = jpretty::take_chars(string_trim(comment), 500)
+    end
+    let o = jx::ob()
+    jx::p_int(o, "stars", stars)
+    jx::p_opt(o, "comment", c, c != "")
+    jx::p_str(o, "timestamp", now_iso())
+    let review: string = jx::ob_end(o)
+
+    let store: string = load()
+    let k: string = key(source, v.val)
+    let mut items: [string] = jx::array_items(jx::get_raw(store, k))
+    items = array_push(items, review)
+    if array_len(items) > MAX_REVIEWS_PER_PACKAGE is
+        let drop: int = array_len(items) - MAX_REVIEWS_PER_PACKAGE
+        let mut kept: [string] = []
+        let mut i: int = drop
+        while i < array_len(items) is
+            kept = array_push(kept, items[i])
+            i += 1
+        end
+        items = kept
+    end
+    let result: string = aggregate(items)
+    let newstore: string = jx::set_raw(store, k, jx::arr_raw(items))
+    let p: string = ratings_path()
+    shx::mkdir_p(shx::home() + "/.hackeros/store")
+    if !shx::write_file(p, jpretty::pretty(newstore)) is
+        return shx::fail("Failed to write " + p)
+    end
+    return shx::ok(result)
+end
+
+;; most recent first, raw JSON array
+pub fn get_reviews(source: string, package_id: string) -> string is
+    let v: shx::Res = security::validate_pkg_token(package_id)
+    if !v.ok is return "[]" end
+    let items: [string] = jx::array_items(jx::get_raw(load(), key(source, v.val)))
+    let mut rev: [string] = []
+    let mut i: int = array_len(items) - 1
+    while i >= 0 is
+        rev = array_push(rev, items[i])
+        i -= 1
+    end
+    return jx::arr_raw(rev)
+end
+
+pub fn cmd_submit_rating(args: string) -> shx::Res is
+    let craw: string = jx::get_raw(args, "comment")
+    return submit_rating(jx::get_str(args, "source"), jx::get_str(args, "packageId"), jx::get_int(args, "stars"), jx::raw_to_str(craw), !jx::raw_is_null(craw))
+end
+
+pub fn cmd_get_local_rating(args: string) -> shx::Res is
+    return shx::ok(local_rating_json(jx::get_str(args, "source"), jx::get_str(args, "packageId")))
+end
+
+pub fn cmd_get_reviews(args: string) -> shx::Res is
+    return shx::ok(get_reviews(jx::get_str(args, "source"), jx::get_str(args, "packageId")))
+end
