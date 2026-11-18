@@ -1,0 +1,531 @@
+use "std -> fs"   from "fs"
+use "std -> time" from "time"
+mod jx
+mod shx
+mod jwalk
+mod jpretty
+mod security
+mod cache
+
+const FEED_URL: string = "https://appimage.github.io/feed.json"
+const FEED_TTL_SECS: int = 86400
+const GITHUB_API: string = "https://api.github.com"
+
+fn store_root() -> string is return shx::home() + "/.hackeros/store" end
+fn appimages_dir() -> string is return store_root() + "/appimages" end
+fn feed_cache_path() -> string is return store_root() + "/appimage_feed_cache.tsv" end
+fn installed_path() -> string is return store_root() + "/appimage_installed.json" end
+fn bin_dir() -> string is return shx::home() + "/.local/bin" end
+fn desktop_dir() -> string is return shx::home() + "/.local/share/applications" end
+fn icon_dir() -> string is return shx::home() + "/.local/share/icons/hicolor/128x128/apps" end
+
+fn slugify(repo: string) -> string is
+    return string_replace(repo, "/", "__")
+end
+
+fn clean_field(s: string) -> string is
+    return string_replace(string_replace(string_replace(s, "\t", " "), "\n", " "), "\r", " ")
+end
+
+;; ── feed ──
+fn extract_owner_repo(s: string) -> string is
+    let mut c: string = string_trim(s)
+    if string_ends_with(c, ".git") is c = string_slice(c, 0, string_len(c) - 4) end
+    while string_ends_with(c, "/") is c = string_slice(c, 0, string_len(c) - 1) end
+    let mut rest: string = ""
+    if string_starts_with(c, "https://github.com/") is
+        rest = string_slice(c, 19, string_len(c))
+    elsif string_starts_with(c, "http://github.com/") is
+        rest = string_slice(c, 18, string_len(c))
+    else is
+        return ""
+    end
+    let parts: [string] = str_split(rest, "/")
+    if array_len(parts) < 2 || parts[0] == "" || parts[1] == "" is return "" end
+    return parts[0] + "/" + parts[1]
+end
+
+fn find_github_repo(item: string) -> string is
+    let keys: [string] = ["github", "repo", "repository"]
+    let mut i: int = 0
+    while i < array_len(keys) is
+        let s: string = jwalk::find_str(item, keys[i])
+        if s != "" is
+            let r: string = extract_owner_repo(s)
+            if r != "" is return r end
+        end
+        i += 1
+    end
+    let all: [string] = jwalk::collect_strings(item)
+    let mut j: int = 0
+    while j < array_len(all) is
+        let r2: string = extract_owner_repo(all[j])
+        if r2 != "" is return r2 end
+        j += 1
+    end
+    return ""
+end
+
+fn find_icon_url(item: string) -> string is
+    let keys: [string] = ["icon", "logo"]
+    let mut i: int = 0
+    while i < array_len(keys) is
+        let s: string = jwalk::find_str(item, keys[i])
+        if string_starts_with(s, "http") is return s end
+        i += 1
+    end
+    return ""
+end
+
+fn find_categories(item: string) -> string is
+    if !jwalk::is_obj(item) is return "" end
+    let ks: [string] = jx::keys(item)
+    let mut i: int = 0
+    while i < array_len(ks) is
+        if string_contains(string_lower(ks[i]), "categor") is
+            return iter_join(jwalk::collect_strings(jx::get_raw(item, ks[i])), ";")
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn parse_feed(json: string) -> string is
+    let mut arr: string = string_trim(json)
+    if !jwalk::is_arr(arr) is
+        let wanted: [string] = ["items", "apps", "data"]
+        let mut found: string = ""
+        let mut k: int = 0
+        while k < array_len(wanted) && found == "" is
+            let v: string = jx::get_raw(arr, wanted[k])
+            if jwalk::is_arr(v) is found = v end
+            k += 1
+        end
+        arr = found
+    end
+    let items: [string] = jx::array_items(arr)
+    let sb = sb_new()
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < array_len(items) is
+        let item: string = items[i]
+        i += 1
+        let name: string = jwalk::find_str(item, "name")
+        if name == "" is continue end
+        let repo: string = find_github_repo(item)
+        if repo == "" is continue end
+        let mut home: string = jwalk::find_str(item, "homepage")
+        if home == "" is home = jwalk::find_str(item, "website") end
+        sb_push(sb, clean_field(name) + "\t" + clean_field(jwalk::find_str(item, "description")) + "\t" + clean_field(repo) + "\t" + clean_field(home) + "\t" + clean_field(find_icon_url(item)) + "\t" + clean_field(find_categories(item)) + "\n")
+        n += 1
+    end
+    if n == 0 is return "" end
+    return sb_build(sb)
+end
+
+;; zwraca wiersze TSV (bez nagłówka) albo "" gdy brak
+fn load_cache(max_age: int) -> string is
+    let p: string = feed_cache_path()
+    if !fs::is_file(p) is return "" end
+    let t: string = fs::read(p)
+    let nl: int = string_find(t, "\n")
+    if nl < 1 || !string_starts_with(t, "#") is return "" end
+    let at: int = str_to_int(string_slice(t, 1, nl))
+    if max_age >= 0 && time::now_unix() - at >= max_age is return "" end
+    return string_slice(t, nl + 1, string_len(t))
+end
+
+fn save_cache(tsv: string) is
+    shx::mkdir_p(store_root())
+    let tmp: string = feed_cache_path() + ".tmp"
+    if shx::write_file(tmp, "#" + to_string(time::now_unix()) + "\n" + tsv) is fs::rename(tmp, feed_cache_path()) end
+end
+
+fn http_get(url: string, secs: int) -> shx::Out is
+    return shx::run_timeout(["curl", "-fsSL", "--max-time", to_string(secs), "-A", "hackeros-store", url], secs + 2)
+end
+
+;; TSV wpisów feedu (po świeżym cache albo pobraniu). "" = brak danych.
+fn ensure_feed(force: bool) -> string is
+    if !force is
+        let fresh: string = load_cache(FEED_TTL_SECS)
+        if fresh != "" is return fresh end
+    end
+    let o: shx::Out = http_get(FEED_URL, 8)
+    if o.spawned && !o.timed_out && o.code == 0 is
+        let tsv: string = parse_feed(o.stdout)
+        if tsv != "" is
+            save_cache(tsv)
+            return tsv
+        end
+    end
+    return load_cache(-1)
+end
+
+pub fn refresh_feed() -> shx::Res is
+    let tsv: string = ensure_feed(true)
+    if tsv == "" is return shx::fail("Could not reach the AppImageHub feed and no local cache exists yet.") end
+    let lines: [string] = shx::lines_of(tsv)
+    return shx::ok(to_string(array_len(lines)))
+end
+
+pub fn cmd_refresh_appimage_feed(args: string) -> shx::Res is
+    let r: shx::Res = refresh_feed()
+    if r.ok is cache_drop_appimage() end
+    return r
+end
+
+fn cache_drop_appimage() is
+    cache::drop_source("appimage")
+end
+
+fn mime_of(url: string) -> string is
+    return if string_ends_with(url, ".svg") then "image/svg+xml" else "image/png"
+end
+
+;; data URL albo "" (gdy brak/za duże)
+pub fn fetch_icon_b64(url: string) -> string is
+    let base: string = fs::temp_file("hos-ico-")
+    let o: shx::Out = shx::run_timeout(["curl", "-fsSL", "--max-time", "5", "-A", "hackeros-store", "-o", base, url], 7)
+    if !o.spawned || o.timed_out || o.code != 0 || !fs::exists(base) is
+        fs::remove(base)
+        return ""
+    end
+    let sz: int = fs::size(base)
+    if sz <= 0 || sz > 2000000 is
+        fs::remove(base)
+        return ""
+    end
+    let b: shx::Out = shx::run(["base64", "-w0", base])
+    fs::remove(base)
+    if b.code != 0 is return "" end
+    return "data:" + mime_of(url) + ";base64," + string_trim(b.stdout)
+end
+
+;; Res: ok => JSON tablica DiscoverResult; !ok => err = JSON SourceIssue
+pub fn search(query: string) -> shx::Res is
+    let q: string = string_lower(query)
+    let tsv: string = ensure_feed(false)
+    if tsv == "" is
+        let o = jx::ob()
+        jx::p_str(o, "source", "appimage")
+        jx::p_str(o, "kind", "unavailable")
+        jx::p_str(o, "message", "Could not reach the AppImageHub feed and no local cache exists yet.")
+        return shx::fail(jx::ob_end(o))
+    end
+    let lines: [string] = shx::lines_of(tsv)
+    let mut hits: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) && array_len(hits) < 10 is
+        let f: [string] = str_split(lines[i], "\t")
+        i += 1
+        if array_len(f) < 3 is continue end
+        let hay: string = string_lower(f[0]) + " " + string_lower(f[1])
+        if string_contains(hay, q) is hits = array_push(hits, lines[i - 1]) end
+    end
+    ;; ikony pobierane równolegle (każda przez curl w tle)
+    let mut scripts: [string] = []
+    let mut h: int = 0
+    while h < array_len(hits) is
+        let f2: [string] = str_split(hits[h], "\t")
+        let icon_url: string = if array_len(f2) > 4 then f2[4] else ""
+        scripts = array_push(scripts, if icon_url == "" then "true" else "curl -fsSL --max-time 5 -A hackeros-store " + shx::q(icon_url) + " | head -c 2000001 | base64 -w0")
+        h += 1
+    end
+    let p: shx::ParOut = shx::par(scripts, 7)
+    let mut out: [string] = []
+    let mut k: int = 0
+    while k < array_len(hits) is
+        let f3: [string] = str_split(hits[k], "\t")
+        let icon_url2: string = if array_len(f3) > 4 then f3[4] else ""
+        let b64: string = string_trim(p.outs[k])
+        let has_icon: bool = icon_url2 != "" && p.codes[k] == 0 && b64 != "" && string_len(b64) < 2700000
+        let r = jx::ob()
+        jx::p_str(r, "name", f3[0])
+        jx::p_str(r, "version", "")
+        jx::p_str(r, "desc", f3[1])
+        jx::p_str(r, "source", "appimage")
+        jx::p_str(r, "package_id", f3[2])
+        jx::p_null(r, "size")
+        jx::p_opt(r, "icon", "data:" + mime_of(icon_url2) + ";base64," + b64, has_icon)
+        out = array_push(out, jx::ob_end(r))
+        k += 1
+    end
+    return shx::ok(jx::arr_raw(out))
+end
+
+;; wpis feedu dla repo jako JSON {name,description,repo,homepage,icon_url,categories[]} albo ""
+pub fn feed_entry(repo: string) -> string is
+    let tsv: string = ensure_feed(false)
+    if tsv == "" is return "" end
+    let want: string = string_lower(repo)
+    let lines: [string] = shx::lines_of(tsv)
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let f: [string] = str_split(lines[i], "\t")
+        i += 1
+        if array_len(f) < 3 || string_lower(f[2]) != want is continue end
+        let r = jx::ob()
+        jx::p_str(r, "name", f[0])
+        jx::p_str(r, "description", f[1])
+        jx::p_str(r, "repo", f[2])
+        let hp: string = if array_len(f) > 3 then f[3] else ""
+        let ic: string = if array_len(f) > 4 then f[4] else ""
+        jx::p_opt(r, "homepage", hp, hp != "")
+        jx::p_opt(r, "icon_url", ic, ic != "")
+        let cats: string = if array_len(f) > 5 then f[5] else ""
+        jx::p_strs(r, "categories", if cats == "" then [] else str_split(cats, ";"))
+        return jx::ob_end(r)
+    end
+    return ""
+end
+
+;; ── GitHub Releases ──
+;; Res: ok => val = JSON {tag,url,filename,size(-1 gdy brak)}
+fn latest_appimage_asset(repo: string) -> shx::Res is
+    let parts: [string] = str_split(repo, "/")
+    if array_len(parts) < 2 is return shx::fail("Invalid repo — expected 'owner/repo'.") end
+    let body: string = fs::temp_file("hos-gh-")
+    let url: string = GITHUB_API + "/repos/" + parts[0] + "/" + string_slice(repo, string_len(parts[0]) + 1, string_len(repo)) + "/releases/latest"
+    let o: shx::Out = shx::run_timeout(["curl", "-sS", "-L", "--max-time", "8", "-A", "hackeros-store", "-H", "Accept: application/vnd.github+json", "-o", body, "-w", "%{{http_code}}", url], 10)
+    let text: string = if fs::exists(body) then fs::read(body) else ""
+    fs::remove(body)
+    if !o.spawned || o.code != 0 is
+        return shx::fail("Failed to reach GitHub: " + string_trim(o.stderr))
+    end
+    let status: string = string_trim(o.stdout)
+    if status == "404" is return shx::fail(repo + " has no GitHub Releases — nothing to install.") end
+    if string_len(status) != 3 || !string_starts_with(status, "2") is
+        return shx::fail("GitHub API returned " + status + " for " + repo + ".")
+    end
+    let tag: string = jx::get_str(text, "tag_name")
+    let assets: [string] = jx::array_items(jx::get_raw(text, "assets"))
+    let mut i: int = 0
+    while i < array_len(assets) is
+        let a: string = assets[i]
+        i += 1
+        if string_ends_with(string_lower(jx::get_str(a, "name")), ".appimage") is
+            let r = jx::ob()
+            jx::p_str(r, "tag", tag)
+            jx::p_str(r, "url", jx::get_str(a, "browser_download_url"))
+            jx::p_str(r, "filename", jx::get_str(a, "name"))
+            let sz: string = jx::get_str(a, "size")
+            jx::p_int(r, "size", if sz == "" then -1 else str_to_int(sz))
+            return shx::ok(jx::ob_end(r))
+        end
+    end
+    return shx::fail("The latest release of " + repo + " (" + tag + ") has no .AppImage asset attached.")
+end
+
+;; "" = brak aktualizacji; w przeciwnym razie nowy tag
+pub fn check_update(repo: string, installed_version: string) -> string is
+    let a: shx::Res = latest_appimage_asset(repo)
+    if !a.ok is return "" end
+    let tag: string = jx::get_str(a.val, "tag")
+    return if tag != installed_version then tag else ""
+end
+
+;; ── stan zainstalowanych ──
+fn load_installed() -> [string] is
+    let p: string = installed_path()
+    if !fs::is_file(p) is return [] end
+    return jx::array_items(fs::read(p))
+end
+
+fn save_installed(list: [string]) -> shx::Res is
+    shx::mkdir_p(store_root())
+    if !shx::write_file(installed_path(), jpretty::pretty(jx::arr_raw(list))) is
+        return shx::fail("failed to write " + installed_path())
+    end
+    return shx::ok_unit()
+end
+
+;; JSON tablica AppImageInstalled
+pub fn list_installed() -> string is
+    return jx::arr_raw(load_installed())
+end
+
+;; JSON obiektu albo ""
+pub fn is_installed(repo: string) -> string is
+    let l: [string] = load_installed()
+    let mut i: int = 0
+    while i < array_len(l) is
+        if string_lower(jx::get_str(l[i], "repo")) == string_lower(repo) is return l[i] end
+        i += 1
+    end
+    return ""
+end
+
+fn without_repo(l: [string], repo: string) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(l) is
+        if string_lower(jx::get_str(l[i], "repo")) != string_lower(repo) is out = array_push(out, l[i]) end
+        i += 1
+    end
+    return out
+end
+
+fn desktop_path(slug: string) -> string is
+    return desktop_dir() + "/appimage-" + slug + ".desktop"
+end
+
+fn safe_bin_name(s: string) -> bool is
+    if string_len(s) == 0 is return false end
+    let mut i: int = 0
+    while i < string_len(s) is
+        let b: int = byte_at(s, i)
+        let ok: bool = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 95
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn install(repo_in: string, display_name: string) -> shx::Res is
+    let rv: shx::Res = security::validate_pkg_token(repo_in)
+    if !rv.ok is return rv end
+    let repo: string = rv.val
+    let slug: string = slugify(repo)
+    let nv: shx::Res = security::validate_pkg_token(display_name)
+    let name_slug: string = if nv.ok then nv.val else slug
+    let bin_name: string = if safe_bin_name(name_slug) then name_slug else slug
+
+    shx::emit_log("info", "Looking up latest release for " + repo + "...")
+    let ar: shx::Res = latest_appimage_asset(repo)
+    if !ar.ok is return ar end
+    let asset: string = ar.val
+    let tag: string = jx::get_str(asset, "tag")
+    let filename: string = jx::get_str(asset, "filename")
+    let c1: shx::Res = shx::check_cancel()
+    if !c1.ok is return c1 end
+
+    let version_dir: string = appimages_dir() + "/" + slug + "/" + tag
+    shx::mkdir_p(version_dir)
+    if !fs::is_dir(version_dir) is return shx::fail("Failed to create " + version_dir) end
+    let target: string = version_dir + "/" + filename
+    let size: int = jx::get_int(asset, "size")
+    let size_txt: string = if size < 0 then "" else to_string(size / 1048576) + "." + to_string((size % 1048576) * 10 / 1048576) + " MB"
+    shx::emit_log("info", "Downloading " + filename + " (" + size_txt + ")...")
+    shx::emit_prog("download", "Downloading " + filename + "...", 0.2)
+    let d: shx::Res = shx::run_streaming(["wget", "-q", "-O", target, jx::get_str(asset, "url")])
+    if !d.ok is return d end
+    let c2: shx::Res = shx::check_cancel()
+    if !c2.ok is return c2 end
+    shx::run(["chmod", "755", target])
+
+    shx::emit_log("info", "Integrating with the desktop (wrapper + .desktop entry)...")
+    shx::emit_prog("install", "Setting up desktop integration...", 0.7)
+    shx::mkdir_p(bin_dir())
+    let wrapper: string = bin_dir() + "/" + bin_name
+    shx::run(["rm", "-f", wrapper])
+    let ln: shx::Out = shx::run(["ln", "-s", target, wrapper])
+    if ln.code != 0 is return shx::fail("Failed to link " + wrapper + ": " + string_trim(ln.stderr)) end
+
+    let entry: string = feed_entry(repo)
+    let icon_url: string = if entry == "" then "" else jx::get_str(entry, "icon_url")
+    let mut icon_path: string = ""
+    if icon_url != "" is icon_path = download_icon_to_disk(icon_url, slug) end
+
+    shx::mkdir_p(desktop_dir())
+    let dp: string = desktop_path(slugify(display_name))
+    let icon_line: string = if icon_path == "" then "" else "Icon=" + icon_path + "\n"
+    let content: string = "[Desktop Entry]\nType=Application\nName=" + display_name + "\nExec=\"" + wrapper + "\" %U\n" + icon_line + "Categories=Utility;\nTerminal=false\nX-AppImage-Source=appimagehub\n"
+    if !shx::write_file(dp, content) is return shx::fail("Failed to write .desktop entry: " + dp) end
+
+    let list: [string] = load_installed()
+    let prev: string = jx::get_str(is_installed(repo), "version")
+    let mut kept: [string] = without_repo(list, repo)
+    let o = jx::ob()
+    jx::p_str(o, "repo", repo)
+    jx::p_str(o, "name", display_name)
+    jx::p_str(o, "version", tag)
+    jx::p_opt(o, "previous_version", prev, prev != "")
+    jx::p_str(o, "exec_path", wrapper)
+    jx::p_str(o, "desktop_path", dp)
+    jx::p_opt(o, "icon_path", icon_path, icon_path != "")
+    kept = array_push(kept, jx::ob_end(o))
+    let sv: shx::Res = save_installed(kept)
+    if !sv.ok is return sv end
+
+    shx::emit_prog("done", "Done!", 1.0)
+    shx::emit_log("success", display_name + " " + tag + " installed.")
+    return shx::ok_unit()
+end
+
+fn download_icon_to_disk(url: string, slug: string) -> string is
+    let b64: string = fetch_icon_b64(url)
+    if b64 == "" is return "" end
+    let comma: int = string_find(b64, ",")
+    if comma < 0 is return "" end
+    shx::mkdir_p(icon_dir())
+    let path: string = icon_dir() + "/" + slug + ".png"
+    let tmp: string = fs::temp_file("hos-ico64-")
+    fs::write(tmp, string_slice(b64, comma + 1, string_len(b64)))
+    let o: shx::Out = shx::run(["sh", "-c", "base64 -d < " + shx::q(tmp) + " > " + shx::q(path)])
+    fs::remove(tmp)
+    if o.code != 0 || !fs::exists(path) is return "" end
+    return path
+end
+
+pub fn uninstall(repo_in: string) -> shx::Res is
+    let rv: shx::Res = security::validate_pkg_token(repo_in)
+    if !rv.ok is return rv end
+    let repo: string = rv.val
+    let entry: string = is_installed(repo)
+    if entry == "" is return shx::fail(repo + " is not installed via AppImage.") end
+    let name: string = jx::get_str(entry, "name")
+    shx::emit_log("info", "Removing " + name + "...")
+    shx::emit_prog("uninstall", "Removing " + name + "...", 0.4)
+    shx::run(["rm", "-f", jx::get_str(entry, "exec_path")])
+    shx::run(["rm", "-f", jx::get_str(entry, "desktop_path")])
+    let ip: string = jx::get_str(entry, "icon_path")
+    if ip != "" is shx::run(["rm", "-f", ip]) end
+    let sv: shx::Res = save_installed(without_repo(load_installed(), repo))
+    if !sv.ok is return sv end
+    shx::emit_prog("done", "Removed.", 1.0)
+    shx::emit_log("success", name + " removed.")
+    return shx::ok_unit()
+end
+
+pub fn rollback(repo_in: string) -> shx::Res is
+    let rv: shx::Res = security::validate_pkg_token(repo_in)
+    if !rv.ok is return rv end
+    let repo: string = rv.val
+    let list: [string] = load_installed()
+    let entry: string = is_installed(repo)
+    if entry == "" is return shx::fail(repo + " is not installed via AppImage.") end
+    let prev: string = jx::get_str(entry, "previous_version")
+    if prev == "" is return shx::fail("No previous version is recorded for this AppImage — nothing to roll back to.") end
+    let slug: string = slugify(repo)
+    let version_dir: string = appimages_dir() + "/" + slug + "/" + prev
+    let mut file: string = ""
+    if fs::is_dir(version_dir) is
+        let names: [string] = fs::list_dir(version_dir)
+        if array_len(names) > 0 is
+            let n: string = names[0]
+            file = if string_starts_with(n, "/") then n else version_dir + "/" + n
+        end
+    end
+    if file == "" is
+        return shx::fail("Version " + prev + " of " + repo + " is no longer cached on disk under " + version_dir + " — can't roll back without re-downloading it.")
+    end
+    let exec_path: string = jx::get_str(entry, "exec_path")
+    let i2: int = string_rfind(exec_path, "/")
+    let bin_name: string = if i2 < 0 then slug else string_slice(exec_path, i2 + 1, string_len(exec_path))
+    let wrapper: string = bin_dir() + "/" + bin_name
+    shx::run(["rm", "-f", wrapper])
+    let ln: shx::Out = shx::run(["ln", "-s", file, wrapper])
+    if ln.code != 0 is return shx::fail("Failed to relink " + wrapper + ": " + string_trim(ln.stderr)) end
+    let current: string = jx::get_str(entry, "version")
+    let name: string = jx::get_str(entry, "name")
+    let mut e2: string = jx::set_str(entry, "previous_version", current)
+    e2 = jx::set_str(e2, "version", prev)
+    let mut out: [string] = without_repo(list, repo)
+    out = array_push(out, e2)
+    let sv: shx::Res = save_installed(out)
+    if !sv.ok is return sv end
+    let msg: string = "Rolled " + name + " back from " + current + " to " + prev + "."
+    shx::emit_log("success", msg)
+    return shx::ok(msg)
+end
