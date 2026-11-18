@@ -1,0 +1,61 @@
+use "std -> fs" from "fs"
+mod jx
+mod shx
+mod jpretty
+
+fn queue_path() -> string is
+    return shx::home() + "/.hackeros/store/queue.json"
+end
+
+;; Re-serializes jobs as PersistedJob {id, kind, label, payload}. ok=false when any job is malformed.
+fn normalize(arr: string) -> shx::Res is
+    let t: string = string_trim(arr)
+    if !(string_starts_with(t, "[") && string_ends_with(t, "]")) is
+        return shx::fail("invalid type: expected a sequence")
+    end
+    let items: [string] = jx::array_items(t)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        let it: string = items[i]
+        if !(jx::has_key(it, "id") && jx::has_key(it, "kind") && jx::has_key(it, "label") && jx::has_key(it, "payload")) is
+            return shx::fail("missing field in PersistedJob")
+        end
+        let o = jx::ob()
+        jx::p_str(o, "id", jx::get_str(it, "id"))
+        jx::p_str(o, "kind", jx::get_str(it, "kind"))
+        jx::p_str(o, "label", jx::get_str(it, "label"))
+        jx::p_raw(o, "payload", jx::get_raw(it, "payload"))
+        out = array_push(out, jx::ob_end(o))
+        i += 1
+    end
+    return shx::ok(jx::arr_raw(out))
+end
+
+;; raw JSON array of jobs ("[]" when missing/corrupt)
+pub fn load() -> string is
+    let p: string = queue_path()
+    if !fs::exists(p) is return "[]" end
+    let r: shx::Res = normalize(fs::read(p))
+    if r.ok is return r.val end
+    return "[]"
+end
+
+pub fn save(jobs_json: string) -> shx::Res is
+    let r: shx::Res = normalize(jobs_json)
+    if !r.ok is return r end
+    shx::mkdir_p(shx::home() + "/.hackeros/store")
+    let p: string = queue_path()
+    if !shx::write_file(p, jpretty::pretty(r.val)) is
+        return shx::fail("Failed to write " + p)
+    end
+    return shx::ok("null")
+end
+
+pub fn cmd_get_persisted_queue(args: string) -> shx::Res is
+    return shx::ok(load())
+end
+
+pub fn cmd_save_persisted_queue(args: string) -> shx::Res is
+    return save(jx::get_raw(args, "jobs"))
+end
