@@ -1,0 +1,121 @@
+mod shx
+
+pub const MAX_TOKEN_LEN: int = 200
+
+fn is_allowed_byte(b: int) -> bool is
+    if b >= 48 && b <= 57 is return true end
+    if b >= 65 && b <= 90 is return true end
+    if b >= 97 && b <= 122 is return true end
+    ;; . - _ + : @ /
+    return b == 46 || b == 45 || b == 95 || b == 43 || b == 58 || b == 64 || b == 47
+end
+
+fn hex_str(n: int) -> string is
+    let digits: string = "0123456789abcdef"
+    if n == 0 is return "0" end
+    let mut x: int = n
+    let mut out: string = ""
+    while x > 0 is
+        out = string_slice(digits, x % 16, x % 16 + 1) + out
+        x = x / 16
+    end
+    return out
+end
+
+;; Rust `{:?}` for &str
+pub fn debug_str(s: string) -> string is
+    let n: int = string_len(s)
+    let mut out: string = "\""
+    let mut i: int = 0
+    while i < n is
+        let b: int = byte_at(s, i)
+        let c: string = string_slice(s, i, i + 1)
+        if c == "\"" is
+            out = out + "\\\""
+        elsif c == "\\" is
+            out = out + "\\\\"
+        elsif b == 10 is
+            out = out + "\\n"
+        elsif b == 13 is
+            out = out + "\\r"
+        elsif b == 9 is
+            out = out + "\\t"
+        elsif b == 0 is
+            out = out + "\\0"
+        elsif b < 32 || b == 127 is
+            out = out + "\\u{" + hex_str(b) + "}"
+        else is
+            out = out + c
+        end
+        i += 1
+    end
+    return out + "\""
+end
+
+pub fn validate_pkg_token(raw: string) -> shx::Res is
+    let s: string = string_trim(raw)
+    if s == "" is return shx::fail("Empty package identifier.") end
+    if string_len(s) > MAX_TOKEN_LEN is
+        return shx::fail("Package identifier is unreasonably long.")
+    end
+    if string_starts_with(s, "-") is
+        return shx::fail("Package identifier must not start with '-'.")
+    end
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n is
+        if !is_allowed_byte(byte_at(s, i)) is
+            return shx::fail("Rejected package identifier containing disallowed characters: " + debug_str(s) + ". Only letters, digits, and '. - _ + : @ /' are permitted.")
+        end
+        i += 1
+    end
+    if string_contains(s, "..") is
+        return shx::fail("Rejected package identifier containing '..'.")
+    end
+    return shx::ok(s)
+end
+
+fn has_control(s: string) -> bool is
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n is
+        let b: int = byte_at(s, i)
+        if b < 32 || b == 127 is return true end
+        ;; C1 controls U+0080..U+009F = C2 80..C2 9F
+        if b == 194 && i + 1 < n is
+            let b2: int = byte_at(s, i + 1)
+            if b2 >= 128 && b2 <= 159 is return true end
+        end
+        i += 1
+    end
+    return false
+end
+
+pub fn validate_display_name(raw: string) -> shx::Res is
+    let s: string = string_trim(raw)
+    if s == "" is return shx::fail("Empty package identifier.") end
+    if string_len(s) > MAX_TOKEN_LEN is
+        return shx::fail("Package identifier is unreasonably long.")
+    end
+    if has_control(s) is
+        return shx::fail("Package identifier must not contain control characters.")
+    end
+    return shx::ok(s)
+end
+
+;; Ok => val = validated tokens joined with "\n"; Err => first failure
+pub fn validate_all(tokens: [string]) -> shx::Res is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(tokens) is
+        let r: shx::Res = validate_pkg_token(tokens[i])
+        if !r.ok is return r end
+        out = if i == 0 then r.val else out + "\n" + r.val
+        i += 1
+    end
+    return shx::ok(out)
+end
+
+pub fn sh_quote(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
