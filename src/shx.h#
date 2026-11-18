@@ -1,0 +1,318 @@
+use "std -> process" from "proc"
+use "std -> fs"      from "fs"
+use "std -> env"     from "env"
+use "std -> time"    from "time"
+mod jx
+
+;; Odpowiednik Result<String, String>: ok=true -> val, ok=false -> err
+pub struct Res is
+    pub ok:  bool
+    pub val: string
+    pub err: string
+end
+
+pub fn ok(v: string) -> Res is
+    return Res { ok: true, val: v, err: "" }
+end
+
+pub fn ok_unit() -> Res is
+    return Res { ok: true, val: "", err: "" }
+end
+
+pub fn fail(e: string) -> Res is
+    return Res { ok: false, val: "", err: e }
+end
+
+;; Wynik uruchomienia procesu (odpowiednik std::process::Output)
+pub struct Out is
+    pub spawned:   bool     ;; false = nie dało się uruchomić (brak programu)
+    pub code:      int      ;; kod wyjścia (-1 gdy nieznany), 124 = timeout
+    pub timed_out: bool
+    pub stdout:    string
+    pub stderr:    string
+end
+
+pub const CANCELLED_MSG: string = "Cancelled by user."
+
+;; ── cytowanie / składanie polecenia ──
+pub fn q(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+pub fn join_argv(argv: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(argv) is
+        out = if i == 0 then q(argv[i]) else out + " " + q(argv[i])
+        i += 1
+    end
+    return out
+end
+
+fn tmp_base() -> string is
+    return fs::temp_file("hos-")
+end
+
+fn read_or_empty(path: string) -> string is
+    if fs::exists(path) is return fs::read(path) end
+    return ""
+end
+
+fn cleanup(base: string) is
+    fs::remove(base + ".o")
+    fs::remove(base + ".e")
+    fs::remove(base + ".c")
+    fs::remove(base)
+end
+
+;; Uruchom argv (bez powłoki), zbierz stdout/stderr/kod. env_prefix: np. "FOO=1 BAR=2 " (już zacytowane) lub "".
+pub fn run_env(env_prefix: string, argv: [string], timeout_s: int) -> Out is
+    if array_len(argv) == 0 is
+        return Out { spawned: false, code: -1, timed_out: false, stdout: "", stderr: "" }
+    end
+    let base: string = tmp_base()
+    let mut cmd: string = join_argv(argv)
+    if env_prefix != "" is cmd = "env " + env_prefix + cmd end
+    if timeout_s > 0 is cmd = "timeout -k 2 " + to_string(timeout_s) + " " + cmd end
+    let full: string = cmd + " > " + q(base + ".o") + " 2> " + q(base + ".e") + " < /dev/null; echo $? > " + q(base + ".c")
+    proc::run(full)
+    let code_s: string = string_trim(read_or_empty(base + ".c"))
+    let code: int = if code_s == "" then -1 else str_to_int(code_s)
+    let o: string = read_or_empty(base + ".o")
+    let e: string = read_or_empty(base + ".e")
+    cleanup(base)
+    ;; 127 = „command not found” z powłoki -> traktujemy jak nieuruchomiony
+    let spawned: bool = !(code == 127 && o == "")
+    return Out { spawned: spawned, code: code, timed_out: code == 124 || code == 137, stdout: o, stderr: e }
+end
+
+pub fn run(argv: [string]) -> Out is
+    return run_env("", argv, 0)
+end
+
+;; Jak Command::output() owinięte w run_timeout(cmd, secs): None/timeout -> spawned=false lub timed_out=true
+pub fn run_timeout(argv: [string], secs: int) -> Out is
+    return run_env("", argv, secs)
+end
+
+;; Prawdziwa powłoka (tylko gdy niezbędna: potok, &&, przekierowanie). NIGDY nie wstawiaj niezwalidowanych danych.
+pub fn run_sh(script: string, timeout_s: int) -> Out is
+    return run_env("", ["sh", "-c", script], timeout_s)
+end
+
+;; Czy program jest w PATH (odpowiednik `which X` -> success)
+pub fn has(cmd: string) -> bool is
+    return proc::which(cmd) != ""
+end
+
+pub fn lines_of(s: string) -> [string] is
+    let parts: [string] = str_split(s, "\n")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(parts) is
+        let l: string = string_trim_right(parts[i])
+        ;; ostatni pusty fragment po końcowym \n pomijamy (jak str::lines)
+        if !(i == array_len(parts) - 1 && l == "") is
+            out = array_push(out, if string_ends_with(parts[i], "\r") then string_slice(parts[i], 0, string_len(parts[i]) - 1) else parts[i])
+        end
+        i += 1
+    end
+    return out
+end
+
+;; ───────────────────────── równoległe zapytania ─────────────────────────
+;; Uruchamia wiele poleceń powłoki równolegle (każde z limitem czasu). Zwraca stdout każdego (pusty gdy timeout/błąd)
+;; oraz kod wyjścia w codes. Odpowiednik tokio::JoinSet/join!.
+pub struct ParOut is
+    pub outs:  [string]
+    pub codes: [int]
+end
+
+pub fn par(scripts: [string], timeout_s: int) -> ParOut is
+    let mut bases: [string] = []
+    let mut i: int = 0
+    while i < array_len(scripts) is
+        let base: string = tmp_base()
+        bases = array_push(bases, base)
+        let inner: string = "timeout -k 2 " + to_string(timeout_s) + " sh -c " + q(scripts[i]) + " > " + q(base + ".o") + " 2> /dev/null < /dev/null; echo $? > " + q(base + ".c") + "; : > " + q(base + ".d")
+        proc::spawn(inner)
+        i += 1
+    end
+    let deadline: int = time::now_ms() + (timeout_s + 3) * 1000
+    let mut pending: bool = true
+    while pending && time::now_ms() < deadline is
+        pending = false
+        let mut j: int = 0
+        while j < array_len(bases) is
+            if !fs::exists(bases[j] + ".d") is pending = true end
+            j += 1
+        end
+        if pending is time::sleep_ms(40) end
+    end
+    let mut outs: [string] = []
+    let mut codes: [int] = []
+    let mut k: int = 0
+    while k < array_len(bases) is
+        let b: string = bases[k]
+        let cs: string = string_trim(read_or_empty(b + ".c"))
+        codes = array_push(codes, if cs == "" then -1 else str_to_int(cs))
+        outs = array_push(outs, read_or_empty(b + ".o"))
+        fs::remove(b + ".o")
+        fs::remove(b + ".c")
+        fs::remove(b + ".d")
+        fs::remove(b)
+        k += 1
+    end
+    return ParOut { outs: outs, codes: codes }
+end
+
+;; ───────────────────────── zdarzenia zadania (worker) ─────────────────────────
+;; Proces roboczy dostaje katalog zadania w HOS_JOB_DIR. Zdarzenia to linie JSON dopisywane do $HOS_JOB_DIR/events:
+;;   {"e":"install_log","p":{"stream":"info","line":"..."}}
+;; Poza workerem (HOS_JOB_DIR puste) emitowanie jest no-op.
+pub fn job_dir() -> string is
+    return env::get("HOS_JOB_DIR")
+end
+
+pub fn emit(event: string, payload_json: string) is
+    let d: string = job_dir()
+    if d == "" is return end
+    let line: string = "{\"e\":" + jx::quote(event) + ",\"p\":" + payload_json + "}\n"
+    fs::append(d + "/events", line)
+end
+
+pub fn emit_log(stream: string, line: string) is
+    let o = jx::ob()
+    jx::p_str(o, "stream", stream)
+    jx::p_str(o, "line", line)
+    emit("install_log", jx::ob_end(o))
+end
+
+;; progress: 0.0..1.0 podawany jako tysięczne części (300 = 0.3) żeby uniknąć f64
+pub fn emit_prog(step: string, message: string, pct: f64) is
+    let o = jx::ob()
+    jx::p_str(o, "step", step)
+    jx::p_str(o, "message", message)
+    jx::p_raw(o, "progress", to_string(pct))
+    emit("install_progress", jx::ob_end(o))
+end
+
+pub fn is_cancelled() -> bool is
+    let d: string = job_dir()
+    if d == "" is return false end
+    return fs::exists(d + "/cancel")
+end
+
+pub fn check_cancel() -> Res is
+    if is_cancelled() is return fail(CANCELLED_MSG) end
+    return ok_unit()
+end
+
+;; ───────────────────────── run_streaming / priv_run ─────────────────────────
+;; Uruchamia polecenie i na żywo przekazuje linie stdout/stderr jako install_log (stream "stdout"/"stderr").
+pub fn run_streaming_env(argv: [string], env_prefix: string) -> Res is
+    let c: Res = check_cancel()
+    if !c.ok is return c end
+    if array_len(argv) == 0 is return fail("spawn '': empty command") end
+    if proc::which(argv[0]) == "" is
+        return fail("spawn '" + argv[0] + "': No such file or directory (os error 2)")
+    end
+    let base: string = tmp_base()
+    let mut cmd: string = join_argv(argv)
+    if env_prefix != "" is cmd = "env " + env_prefix + cmd end
+    let full: string = "( " + cmd + " > " + q(base + ".o") + " 2> " + q(base + ".e") + " < /dev/null; echo $? > " + q(base + ".c") + "; : > " + q(base + ".d") + " )"
+    proc::spawn(full)
+    let mut off_o: int = 0
+    let mut off_e: int = 0
+    let mut finished: bool = false
+    while !finished is
+        finished = fs::exists(base + ".d")
+        off_o = pump_lines(base + ".o", off_o, "stdout", finished)
+        off_e = pump_lines(base + ".e", off_e, "stderr", finished)
+        if !finished is time::sleep_ms(120) end
+    end
+    let code_s: string = string_trim(read_or_empty(base + ".c"))
+    let code: int = if code_s == "" then -1 else str_to_int(code_s)
+    cleanup(base)
+    fs::remove(base + ".d")
+    if is_cancelled() is return fail(CANCELLED_MSG) end
+    if code == 0 is return ok_unit() end
+    return fail("'" + argv[0] + "' exited " + to_string(code))
+end
+
+pub fn run_streaming(argv: [string]) -> Res is
+    return run_streaming_env(argv, "")
+end
+
+;; Czyta nowe bajty pliku od offset, emituje pełne linie (a na końcu także niepełną). Zwraca nowy offset.
+fn pump_lines(path: string, offset: int, stream: string, last: bool) -> int is
+    if !fs::exists(path) is return offset end
+    let size: int = fs::size(path)
+    if size <= offset is return offset end
+    let chunk: string = proc::run_args("tail", ["-c", "+" + to_string(offset + 1), path])
+    let mut consumed: int = 0
+    let mut start: int = 0
+    let n: int = string_len(chunk)
+    let mut i: int = 0
+    while i < n is
+        if byte_at(chunk, i) == 10 is
+            let line: string = string_slice(chunk, start, i)
+            emit_log(stream, if string_ends_with(line, "\r") then string_slice(line, 0, string_len(line) - 1) else line)
+            start = i + 1
+            consumed = start
+        end
+        i += 1
+    end
+    if last && start < n is
+        emit_log(stream, string_slice(chunk, start, n))
+        consumed = n
+    end
+    return offset + consumed
+end
+
+;; Uprzywilejowane polecenie: pkexec -> sudo -n -> sudo (tak jak w Rust).
+pub fn priv_run(args: [string]) -> Res is
+    let c: Res = check_cancel()
+    if !c.ok is return c end
+    let cmd_str: string = jx_join(args, " ")
+    if proc::which("pkexec") != "" is
+        let r: Res = run_streaming(array_concat(["pkexec"], args))
+        if r.ok is return ok_unit() end
+        if is_cancelled() is return fail(CANCELLED_MSG) end
+        emit_log("info", "pkexec failed or was dismissed — falling back to sudo...")
+    end
+    let r2: Res = run_streaming(array_concat(["sudo", "-n"], args))
+    if r2.ok is return ok_unit() end
+    if is_cancelled() is return fail(CANCELLED_MSG) end
+    let r3: Res = run_streaming(array_concat(["sudo"], args))
+    if r3.ok is return ok_unit() end
+    if is_cancelled() is return fail(CANCELLED_MSG) end
+    let msg: string = "Privilege escalation failed: neither pkexec nor sudo could run this command.\nPlease open a terminal and run manually:\n\n  sudo " + cmd_str + "\n\n(sudo error: " + r3.err + ")"
+    emit_log("error", msg)
+    return fail(msg)
+end
+
+pub fn jx_join(parts: [string], sep: string) -> string is
+    return iter_join(parts, sep)
+end
+
+;; Katalog domowy ($HOME albo /root) — jak std::env::var("HOME").unwrap_or("/root")
+pub fn home() -> string is
+    let h: string = env::get("HOME")
+    return if h == "" then "/root" else h
+end
+
+;; Katalog danych sklepu: ~/.hackeros/store
+pub fn store_dir() -> string is
+    return home() + "/.hackeros/store"
+end
+
+pub fn mkdir_p(path: string) is
+    proc::run_args("mkdir", ["-p", path])
+end
+
+;; zapis pliku zgodny z różnymi wersjami std (fs::write zwraca bool albo nic)
+pub fn write_file(path: string, content: string) -> bool is
+    fs::write(path, content)
+    return fs::exists(path)
+end
