@@ -1,0 +1,107 @@
+mod jx
+mod shx
+mod security
+mod history
+mod pkgbackend
+mod curated
+
+pub fn cmd_check_all_installed(args: string) -> shx::Res is
+    return shx::ok(curated::check_all_installed())
+end
+
+pub fn cmd_get_package_info(args: string) -> shx::Res is
+    return shx::ok(curated::get_package_info(jx::get_str(args, "name"), jx::get_str(args, "category")))
+end
+
+pub fn cmd_check_updates_available(args: string) -> shx::Res is
+    return shx::ok(to_string(pkgbackend::upgradable_count()))
+end
+
+fn emsg(r: shx::Res) -> string is
+    return if r.ok then "" else r.err
+end
+
+pub fn cmd_install_package(args: string) -> shx::Res is
+    let v: shx::Res = security::validate_display_name(jx::get_str(args, "name"))
+    if !v.ok is return v end
+    let name: string = v.val
+    let category: string = jx::get_str(args, "category")
+    shx::emit_log("info", "Starting installation of " + name + "...")
+    let mut result: shx::Res = shx::fail("Unknown category: " + category)
+    if category == "game_launchers" is result = curated::install_launcher(name) end
+    if category == "pentest_tools" is result = curated::install_pentest(name) end
+    if category == "drivers" is result = curated::install_driver(name) end
+    if category == "hackeros_ecosystem" is result = curated::install_hackeros_tool(name) end
+    if category == "dev_tools" is result = curated::install_dev_tool(name) end
+    let pentest_apt: bool = category == "pentest_tools" && curated::in_debian(name)
+    let drv: [string] = if category == "drivers" then curated::driver_pkgs(name) else []
+    if array_len(drv) > 0 is
+        let versions: [history::PackageVersion] = if result.ok then history::current_apt_versions(drv) else []
+        history::record_multi("install", "apt", name, name, "", versions, result.ok, emsg(result))
+    else
+        let mut src: string = "curated"
+        let mut pid: string = name
+        if pentest_apt is
+            src = "apt"
+            pid = curated::apt_pkg_name(name)
+        end
+        if category == "dev_tools" is
+            let e: curated::DevEntry = curated::dev_tool_entry(name)
+            if e.found && !e.is_container is
+                src = "apt"
+                pid = e.pkg
+            end
+            if e.found && e.is_container is src = "dev_tools_container" end
+        end
+        if category == "hackeros_ecosystem" is src = "hackeros_ecosystem" end
+        let ver: string = if result.ok && src == "apt" then history::current_apt_version(pid) else ""
+        history::record("install", src, name, pid, ver, result.ok, emsg(result))
+    end
+    if !result.ok is return result end
+    shx::emit_log("success", name + " installed successfully.")
+    return shx::ok(jx::quote(name + " installed successfully."))
+end
+
+pub fn cmd_uninstall_package(args: string) -> shx::Res is
+    let v: shx::Res = security::validate_display_name(jx::get_str(args, "name"))
+    if !v.ok is return v end
+    let name: string = v.val
+    let category: string = jx::get_str(args, "category")
+    shx::emit_log("info", "Removing " + name + "...")
+    let mut result: shx::Res = shx::fail("Unknown category: " + category)
+    if category == "game_launchers" is result = curated::uninstall_launcher(name) end
+    if category == "pentest_tools" is result = curated::uninstall_pentest(name) end
+    if category == "drivers" is result = curated::uninstall_driver(name) end
+    if category == "hackeros_ecosystem" is result = curated::uninstall_hackeros_tool(name) end
+    if category == "dev_tools" is result = curated::uninstall_dev_tool(name) end
+    let mut src: string = "curated"
+    if (category == "pentest_tools" && curated::in_debian(name)) || category == "drivers" is src = "apt" end
+    if category == "dev_tools" is
+        let e: curated::DevEntry = curated::dev_tool_entry(name)
+        if e.found && !e.is_container is src = "apt" end
+        if e.found && e.is_container is src = "dev_tools_container" end
+    end
+    if category == "hackeros_ecosystem" is src = "hackeros_ecosystem" end
+    history::record("uninstall", src, name, name, "", result.ok, emsg(result))
+    if !result.ok is return result end
+    shx::emit_log("success", name + " removed successfully.")
+    return shx::ok(jx::quote(name + " removed successfully."))
+end
+
+pub fn cmd_update_system(args: string) -> shx::Res is
+    let script: string = shx::home() + "/.hackeros/hacker/update-system"
+    let ex: shx::Out = shx::run(["test", "-e", script])
+    if ex.code != 0 is
+        let msg: string = "System update script not found at " + script + ".\nThis feature only works on a HackerOS installation where that script is provided by the base system. On other systems, please update via your normal package manager."
+        shx::emit_log("error", msg)
+        return shx::fail(msg)
+    end
+    shx::emit_log("info", "Running system update...")
+    shx::emit_prog("update", "Running system update...", 0.1)
+    let result: shx::Res = shx::run_streaming([script])
+    history::record("update", "system", "HackerOS system update", "system", "", result.ok, emsg(result))
+    if !result.ok is return result end
+    shx::emit_prog("done", "System updated!", 1.0)
+    shx::emit_log("success", "System updated successfully.")
+    return shx::ok(jx::quote("System updated successfully."))
+end
