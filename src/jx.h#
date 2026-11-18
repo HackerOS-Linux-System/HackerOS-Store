@@ -1,0 +1,368 @@
+pub fn escape(s: string) -> string is
+    let mut out: string = string_replace(s, "\\", "\\\\")
+    out = string_replace(out, "\"", "\\\"")
+    out = string_replace(out, "\n", "\\n")
+    out = string_replace(out, "\r", "\\r")
+    out = string_replace(out, "\t", "\\t")
+    return out
+end
+
+pub fn quote(s: string) -> string is
+    return "\"" + escape(s) + "\""
+end
+
+;; Odwrotność escape dla zawartości napisu JSON (bez otaczających cudzysłowów).
+pub fn unescape(s: string) -> string is
+    if string_find(s, "\\") < 0 is return s end
+    let n: int = string_len(s)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_slice(s, i, i + 1)
+        if c == "\\" && i + 1 < n is
+            let e: string = string_slice(s, i + 1, i + 2)
+            if e == "n" is
+                out = out + "\n"
+            elsif e == "t" is
+                out = out + "\t"
+            elsif e == "r" is
+                out = out + "\r"
+            elsif e == "b" is
+                out = out + "\u0008"
+            elsif e == "f" is
+                out = out + "\u000c"
+            elsif e == "u" && i + 5 < n is
+                let hex: string = string_slice(s, i + 2, i + 6)
+                out = out + char_code_to_str(hex_val(hex))
+                i += 4
+            else is
+                out = out + e
+            end
+            i += 2
+        else is
+            out = out + c
+            i += 1
+        end
+    end
+    return out
+end
+
+fn hex_val(s: string) -> int is
+    let digits: string = "0123456789abcdef"
+    let lower: string = string_lower(s)
+    let mut r: int = 0
+    let mut i: int = 0
+    while i < string_len(lower) is
+        let idx: int = string_find(digits, string_slice(lower, i, i + 1))
+        if idx < 0 is return 63 end
+        r = r * 16 + idx
+        i += 1
+    end
+    return r
+end
+
+fn is_ws(c: string) -> bool is
+    return c == " " || c == "\n" || c == "\t" || c == "\r"
+end
+
+;; Rozbija tekst obiektu/tablicy na elementy najwyższego poziomu (surowe teksty).
+;; Dla obiektu elementem jest "klucz:wartość" (klucz z cudzysłowami).
+fn split_top(body: string) -> [string] is
+    ;; Wycina kawałki (string_slice) zamiast sklejać je znak po znaku: `cur = cur + c` robiło O(n²) śmieci,
+    ;; a backend C++ H# nie zwalnia pamięci (każdy get_raw na kilkukilobajtowym store = MB wycieku).
+    let n: int = string_len(body)
+    let mut out: [string] = []
+    let mut depth: int = 0
+    let mut in_str: bool = false
+    let mut esc: bool = false
+    let mut start: int = 0
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_slice(body, i, i + 1)
+        i += 1
+        if in_str is
+            if esc is
+                esc = false
+            elsif c == "\\" is
+                esc = true
+            elsif c == "\"" is
+                in_str = false
+            end
+            continue
+        end
+        if c == "\"" is
+            in_str = true
+        elsif c == "[" || c == "{" is
+            depth += 1
+        elsif c == "]" || c == "}" is
+            depth -= 1
+        elsif c == "," && depth == 0 is
+            let seg: string = string_trim(string_slice(body, start, i - 1))
+            if seg != "" is out = array_push(out, seg) end
+            start = i
+        end
+    end
+    let tail: string = string_trim(string_slice(body, start, n))
+    if tail != "" is out = array_push(out, tail) end
+    return out
+end
+
+fn inner_of(raw: string, open: string, close: string) -> string is
+    let t: string = string_trim(raw)
+    if string_len(t) >= 2 && string_slice(t, 0, 1) == open && string_ends_with(t, close) is
+        return string_slice(t, 1, string_len(t) - 1)
+    end
+    return ""
+end
+
+;; Elementy tablicy JSON jako surowe teksty.
+pub fn array_items(arr: string) -> [string] is
+    return split_top(inner_of(arr, "[", "]"))
+end
+
+;; Pozycja ':' po cudzysłowie zamykającym klucz w "klucz":wartość
+fn colon_pos(entry: string) -> int is
+    let n: int = string_len(entry)
+    let mut in_str: bool = false
+    let mut esc: bool = false
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_slice(entry, i, i + 1)
+        if in_str is
+            if esc is
+                esc = false
+            elsif c == "\\" is
+                esc = true
+            elsif c == "\"" is
+                in_str = false
+            end
+        elsif c == "\"" is
+            in_str = true
+        elsif c == ":" is
+            return i
+        end
+        i += 1
+    end
+    return -1
+end
+
+fn entry_key(entry: string) -> string is
+    let cp: int = colon_pos(entry)
+    if cp < 0 is return "" end
+    let k: string = string_trim(string_slice(entry, 0, cp))
+    if string_len(k) >= 2 is return unescape(string_slice(k, 1, string_len(k) - 1)) end
+    return k
+end
+
+fn entry_val(entry: string) -> string is
+    let cp: int = colon_pos(entry)
+    if cp < 0 is return "" end
+    return string_trim(string_slice(entry, cp + 1, string_len(entry)))
+end
+
+;; Surowa wartość klucza obiektu ("" gdy brak).
+pub fn get_raw(obj: string, key: string) -> string is
+    let items: [string] = split_top(inner_of(obj, "{", "}"))
+    let mut i: int = 0
+    while i < array_len(items) is
+        if entry_key(items[i]) == key is return entry_val(items[i]) end
+        i += 1
+    end
+    return ""
+end
+
+;; Surowa wartość -> zwykły tekst: napis bez cudzysłowów, null -> "", reszta bez zmian.
+pub fn raw_to_str(raw: string) -> string is
+    let t: string = string_trim(raw)
+    if t == "null" is return "" end
+    if string_len(t) >= 2 && string_starts_with(t, "\"") && string_ends_with(t, "\"") is
+        return unescape(string_slice(t, 1, string_len(t) - 1))
+    end
+    return t
+end
+
+pub fn get_str(obj: string, key: string) -> string is
+    return raw_to_str(get_raw(obj, key))
+end
+
+pub fn get_int(obj: string, key: string) -> int is
+    return str_to_int(get_str(obj, key))
+end
+
+pub fn get_bool(obj: string, key: string) -> bool is
+    return get_str(obj, key) == "true"
+end
+
+pub fn has_key(obj: string, key: string) -> bool is
+    let items: [string] = split_top(inner_of(obj, "{", "}"))
+    let mut i: int = 0
+    while i < array_len(items) is
+        if entry_key(items[i]) == key is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn object() -> string is return "{{}}" end
+
+;; Ustawia klucz na surową wartość (nadpisuje lub dopisuje na końcu).
+pub fn set_raw(obj: string, key: string, raw: string) -> string is
+    let items: [string] = split_top(inner_of(obj, "{", "}"))
+    let mut out: string = ""
+    let mut replaced: bool = false
+    let mut i: int = 0
+    while i < array_len(items) is
+        let piece: string = if entry_key(items[i]) == key then quote(key) + ":" + raw else items[i]
+        if entry_key(items[i]) == key is replaced = true end
+        out = if out == "" then piece else out + "," + piece
+        i += 1
+    end
+    if !replaced is
+        let piece: string = quote(key) + ":" + raw
+        out = if out == "" then piece else out + "," + piece
+    end
+    return "{" + out + "}"
+end
+
+pub fn set_str(obj: string, key: string, val: string) -> string is
+    return set_raw(obj, key, quote(val))
+end
+
+pub fn set_int(obj: string, key: string, val: int) -> string is
+    return set_raw(obj, key, to_string(val))
+end
+
+pub fn set_bool(obj: string, key: string, val: bool) -> string is
+    return set_raw(obj, key, if val then "true" else "false")
+end
+
+pub fn remove_key(obj: string, key: string) -> string is
+    let items: [string] = split_top(inner_of(obj, "{", "}"))
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(items) is
+        if entry_key(items[i]) != key is
+            out = if out == "" then items[i] else out + "," + items[i]
+        end
+        i += 1
+    end
+    return "{" + out + "}"
+end
+
+pub fn keys(obj: string) -> [string] is
+    let items: [string] = split_top(inner_of(obj, "{", "}"))
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        out = array_push(out, entry_key(items[i]))
+        i += 1
+    end
+    return out
+end
+
+;; Tablica tekstów -> tekst JSON tablicy
+pub fn str_array(vals: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(vals) is
+        out = if i == 0 then quote(vals[i]) else out + "," + quote(vals[i])
+        i += 1
+    end
+    return "[" + out + "]"
+end
+
+pub fn set_str_array(obj: string, key: string, vals: [string]) -> string is
+    return set_raw(obj, key, str_array(vals))
+end
+
+;; ───────────────────────── builders (O(n), przez string builder) ─────────────────────────
+;; let o = jx::ob()
+;; jx::p_str(o, "name", "x") ; jx::p_int(o, "n", 3) ; jx::p_bool(o, "ok", true) ; jx::p_raw(o, "list", "[1,2]")
+;; let json = jx::ob_end(o)
+pub fn ob() -> any is
+    let b = sb_new()
+    sb_push(b, "{")
+    return b
+end
+
+pub fn p_raw(b: any, key: string, raw: string) is
+    if sb_len(b) > 1 is sb_push(b, ",") end
+    sb_push(b, quote(key))
+    sb_push(b, ":")
+    sb_push(b, raw)
+end
+
+pub fn p_str(b: any, key: string, val: string) is
+    p_raw(b, key, quote(val))
+end
+
+pub fn p_int(b: any, key: string, val: int) is
+    p_raw(b, key, to_string(val))
+end
+
+pub fn p_bool(b: any, key: string, val: bool) is
+    p_raw(b, key, if val then "true" else "false")
+end
+
+pub fn p_null(b: any, key: string) is
+    p_raw(b, key, "null")
+end
+
+;; Option<String>: present=false -> null
+pub fn p_opt(b: any, key: string, val: string, present: bool) is
+    if present is p_raw(b, key, quote(val)) else is p_raw(b, key, "null") end
+end
+
+pub fn p_strs(b: any, key: string, vals: [string]) is
+    p_raw(b, key, str_array(vals))
+end
+
+pub fn ob_end(b: any) -> string is
+    sb_push(b, "}")
+    return sb_build(b)
+end
+
+;; Tablica z surowych elementów JSON: arr_raw(["{...}", "{...}"]) -> "[{...},{...}]"
+pub fn arr_raw(items: [string]) -> string is
+    let b = sb_new()
+    sb_push(b, "[")
+    let mut i: int = 0
+    while i < array_len(items) is
+        if i > 0 is sb_push(b, ",") end
+        sb_push(b, items[i])
+        i += 1
+    end
+    sb_push(b, "]")
+    return sb_build(b)
+end
+
+;; Surowa wartość -> Option<String> w sensie Rusta: null / brak -> false
+pub fn raw_is_null(raw: string) -> bool is
+    let t: string = string_trim(raw)
+    return t == "" || t == "null"
+end
+
+;; Tablica napisów z surowej tablicy JSON
+pub fn get_strs(obj: string, key: string) -> [string] is
+    let items: [string] = array_items(get_raw(obj, key))
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        out = array_push(out, raw_to_str(items[i]))
+        i += 1
+    end
+    return out
+end
+
+;; Wartość z "domyślną": gdy klucza brak lub null -> dflt
+pub fn get_str_or(obj: string, key: string, dflt: string) -> string is
+    let r: string = get_raw(obj, key)
+    if raw_is_null(r) is return dflt end
+    return raw_to_str(r)
+end
+
+pub fn get_bool_or(obj: string, key: string, dflt: bool) -> bool is
+    let r: string = get_raw(obj, key)
+    if raw_is_null(r) is return dflt end
+    return raw_to_str(r) == "true"
+end
