@@ -1,0 +1,91 @@
+use "std -> fs" from "fs"
+use "std -> time" from "time"
+mod shx
+
+fn dir() -> string is
+    return shx::home() + "/.cache/hackeros-store"
+end
+
+fn norm_key(key: string) -> string is
+    return string_replace(string_replace(key, "\n", " "), "\r", " ")
+end
+
+fn path_of(key: string) -> string is
+    return dir() + "/" + sha256(norm_key(key))
+end
+
+;; "" = miss (absent, older than ttl_s, or key mismatch). A stored empty value is also reported as a miss.
+pub fn get(key: string, ttl_s: int) -> string is
+    let p: string = path_of(key)
+    if !fs::is_file(p) is return "" end
+    if ttl_s >= 0 is
+        let age: int = time::now_unix() - fs::modified_time(p)
+        if age > ttl_s is return "" end
+    end
+    let t: string = fs::read(p)
+    let nl: int = string_find(t, "\n")
+    if nl < 0 is return "" end
+    if string_slice(t, 0, nl) != norm_key(key) is return "" end
+    return string_slice(t, nl + 1, string_len(t))
+end
+
+pub fn set(key: string, val: string) is
+    shx::mkdir_p(dir())
+    let p: string = path_of(key)
+    let tmp: string = p + ".tmp" + to_string(time::now_ms())
+    if shx::write_file(tmp, norm_key(key) + "\n" + val) is
+        fs::rename(tmp, p)
+    else is
+        fs::remove(tmp)
+    end
+end
+
+;; remove every entry whose key starts with prefix ("" = everything)
+pub fn drop_prefix(prefix: string) is
+    let d: string = dir()
+    if !fs::is_dir(d) is return end
+    let names: [string] = fs::list_dir(d)
+    let mut i: int = 0
+    while i < array_len(names) is
+        let n: string = names[i]
+        let p: string = if string_starts_with(n, "/") then n else d + "/" + n
+        if fs::is_file(p) is
+            if prefix == "" is
+                fs::remove(p)
+            else is
+                let o: shx::Out = shx::run(["head", "-n", "1", p])
+                if string_starts_with(string_trim_right(o.stdout), prefix) is fs::remove(p) end
+            end
+        end
+        i += 1
+    end
+end
+
+;; invalidate_source_cache z lib.rs: klucze "{source}:…" oraz łączone "search:/browse:…:{a,b,c}" zawierające źródło
+pub fn drop_source(source: string) is
+    let d: string = dir()
+    if !fs::is_dir(d) is return end
+    let names: [string] = fs::list_dir(d)
+    let mut i: int = 0
+    while i < array_len(names) is
+        let n: string = names[i]
+        let p: string = if string_starts_with(n, "/") then n else d + "/" + n
+        if fs::is_file(p) is
+            let o: shx::Out = shx::run(["head", "-n", "1", p])
+            let key: string = string_trim_right(o.stdout)
+            let mut drop: bool = string_starts_with(key, source + ":")
+            if !drop is
+                let c: int = string_rfind(key, ":")
+                let tail: string = if c < 0 then key else string_slice(key, c + 1, string_len(key))
+                let toks: [string] = str_split(tail, ",")
+                let mut j: int = 0
+                while j < array_len(toks) is
+                    if toks[j] == source is drop = true end
+                    j += 1
+                end
+            end
+            if drop is fs::remove(p) end
+        end
+        i += 1
+    end
+end
