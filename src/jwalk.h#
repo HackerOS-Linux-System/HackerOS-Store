@@ -1,0 +1,70 @@
+mod jx
+
+pub fn is_obj(raw: string) -> bool is
+    return string_starts_with(string_trim(raw), "{")
+end
+
+pub fn is_arr(raw: string) -> bool is
+    return string_starts_with(string_trim(raw), "[")
+end
+
+pub fn is_strv(raw: string) -> bool is
+    return string_starts_with(string_trim(raw), "\"")
+end
+
+;; "" gdy brak. Obiekt: najpierw klucze zawierające key_substr (lowercase) o wartości-napisie, potem rekurencja po wartościach-OBIEKTACH.
+;; (jak find_str w appimage.rs: tablice nie są wchodzone)
+pub fn find_str(obj: string, key_substr: string) -> string is
+    if !is_obj(obj) is return "" end
+    let ks: [string] = jx::keys(obj)
+    let mut vals: [string] = []
+    let mut i: int = 0
+    while i < array_len(ks) is
+        let v: string = jx::get_raw(obj, ks[i])
+        vals = array_push(vals, v)
+        if string_contains(string_lower(ks[i]), key_substr) && is_strv(v) is
+            return jx::raw_to_str(v)
+        end
+        i += 1
+    end
+    let mut j: int = 0
+    while j < array_len(vals) is
+        if is_obj(vals[j]) is
+            let f: string = find_str(vals[j], key_substr)
+            if f != "" is return f end
+        end
+        j += 1
+    end
+    return ""
+end
+
+;; wszystkie napisy w drzewie (obiekty, tablice, napisy)
+pub fn collect_strings(raw: string) -> [string] is
+    let mut out: [string] = []
+    out = collect_into(raw, out)
+    return out
+end
+
+fn collect_into(raw: string, acc: [string]) -> [string] is
+    let mut out: [string] = acc
+    let t: string = string_trim(raw)
+    if is_strv(t) is
+        return array_push(out, jx::raw_to_str(t))
+    end
+    if is_obj(t) is
+        let ks: [string] = jx::keys(t)
+        let mut i: int = 0
+        while i < array_len(ks) is
+            out = collect_into(jx::get_raw(t, ks[i]), out)
+            i += 1
+        end
+    elsif is_arr(t) is
+        let items: [string] = jx::array_items(t)
+        let mut j: int = 0
+        while j < array_len(items) is
+            out = collect_into(items[j], out)
+            j += 1
+        end
+    end
+    return out
+end
