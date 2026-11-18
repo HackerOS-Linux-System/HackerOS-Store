@@ -1,0 +1,278 @@
+use "std -> fs" from "fs"
+mod jx
+mod shx
+mod security
+
+pub fn hpm_bin() -> string is
+    if fs::exists("/usr/bin/hpm") is return "/usr/bin/hpm" end
+    if shx::has("hpm") is return "hpm" end
+    return ""
+end
+
+pub fn is_available() -> bool is
+    return hpm_bin() != ""
+end
+
+fn issue(kind: string, message: string) -> shx::Res is
+    let o = jx::ob()
+    jx::p_str(o, "source", "hpm")
+    jx::p_str(o, "kind", kind)
+    jx::p_str(o, "message", message)
+    return shx::fail(jx::ob_end(o))
+end
+
+fn words(s: string) -> [string] is
+    let parts: [string] = str_split(string_replace(string_replace(s, "\t", " "), "\r", " "), " ")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] != "" is out = array_push(out, parts[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; Jeden wiersz tabeli `hpm search` -> JSON DiscoverResult albo "" (pominięty)
+fn parse_search_row(line: string) -> string is
+    let t: string = string_trim(line)
+    if t == "" is return "" end
+    let tokens: [string] = words(t)
+    if array_len(tokens) < 2 is return "" end
+    let mut n: int = array_len(tokens)
+    let mut ordered: [string] = []
+    let mut rev: [string] = []
+    while n > 0 && string_starts_with(tokens[n - 1], "@") is
+        rev = array_push(rev, tokens[n - 1])
+        n -= 1
+    end
+    let mut k: int = array_len(rev) - 1
+    while k >= 0 is
+        ordered = array_push(ordered, rev[k])
+        k -= 1
+    end
+    if n == 0 is return "" end
+    let name: string = tokens[0]
+    if name == "" || name == "Package" is return "" end
+    let version: string = if n > 1 then tokens[1] else ""
+    let mut desc: string = ""
+    let mut j: int = 2
+    while j < n is
+        desc = if desc == "" then tokens[j] else desc + " " + tokens[j]
+        j += 1
+    end
+    if string_ends_with(desc, "…") is desc = string_slice(desc, 0, string_len(desc) - 3) end
+    if array_len(ordered) > 0 is
+        if desc != "" is desc = desc + " " end
+        desc = desc + iter_join(ordered, " ")
+    end
+    let o = jx::ob()
+    jx::p_str(o, "name", name)
+    jx::p_str(o, "version", version)
+    jx::p_str(o, "desc", desc)
+    jx::p_str(o, "source", "hpm")
+    jx::p_str(o, "package_id", name)
+    jx::p_null(o, "size")
+    jx::p_null(o, "icon")
+    return jx::ob_end(o)
+end
+
+pub fn search(query: string) -> shx::Res is
+    let bin: string = hpm_bin()
+    if bin == "" is return issue("unavailable", "hpm is not installed on this system (expected /usr/bin/hpm).") end
+    let o: shx::Out = shx::run_timeout([bin, "search", query], 15)
+    if o.timed_out || !o.spawned is
+        return issue("timeout", "hpm did not respond within 15s (first-run index fetch can be slow).")
+    end
+    let text: string = o.stdout
+    if string_contains(text, "No results for") || string_contains(text, "No packages found") is return shx::ok("[]") end
+    let lines: [string] = shx::lines_of(text)
+    let mut results: [string] = []
+    let mut in_table: bool = false
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let line: string = lines[i]
+        i += 1
+        let tl: string = string_trim(line)
+        if string_starts_with(tl, "─") is
+            in_table = true
+            continue
+        end
+        if !in_table is continue end
+        if tl == "" is break end
+        if string_contains(line, "Run ") || string_contains(line, "Search by tag") || string_starts_with(line, "Page ") is break end
+        let r: string = parse_search_row(line)
+        if r != "" is
+            results = array_push(results, r)
+            if array_len(results) >= 12 is break end
+        end
+    end
+    return shx::ok(jx::arr_raw(results))
+end
+
+fn label_val(line: string, label: string) -> string is
+    if string_starts_with(line, label) is
+        return "\u0001" + string_trim(string_slice(line, string_len(label), string_len(line)))
+    end
+    return ""
+end
+
+;; UTF-8-bezpieczne obcięcie do n znaków (jak chars().take(n))
+pub fn take_chars(s: string, n: int) -> string is
+    let mut count: int = 0
+    let mut i: int = 0
+    let len: int = string_len(s)
+    while i < len is
+        let b: int = byte_at(s, i)
+        if (b & 192) != 128 is
+            if count == n is return string_slice(s, 0, i) end
+            count += 1
+        end
+        i += 1
+    end
+    return s
+end
+
+pub fn info(package: string) -> string is
+    let bin: string = hpm_bin()
+    if bin == "" is return "" end
+    let o: shx::Out = shx::run_timeout([bin, "info", package], 8)
+    if !o.spawned || o.timed_out is return "" end
+    let mut version: string = ""
+    let mut authors: string = ""
+    let mut license: string = ""
+    let mut tags: [string] = []
+    let mut installed: string = ""
+    let mut in_desc: bool = false
+    let mut desc_lines: [string] = []
+    let lines: [string] = shx::lines_of(o.stdout)
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let line: string = string_trim_left_ws(lines[i])
+        i += 1
+        let v1: string = label_val(line, "Version:")
+        if v1 != "" is
+            version = string_slice(v1, 1, string_len(v1))
+            in_desc = false
+            continue
+        end
+        let v2: string = label_val(line, "Author:")
+        if v2 != "" is
+            authors = string_slice(v2, 1, string_len(v2))
+            in_desc = false
+            continue
+        end
+        let v3: string = label_val(line, "License:")
+        if v3 != "" is
+            license = string_slice(v3, 1, string_len(v3))
+            in_desc = false
+            continue
+        end
+        let v4: string = label_val(line, "Tags:")
+        if v4 != "" is
+            let ws: [string] = words(string_slice(v4, 1, string_len(v4)))
+            tags = []
+            let mut t: int = 0
+            while t < array_len(ws) is
+                tags = array_push(tags, if string_starts_with(ws[t], "@") then string_slice(ws[t], 1, string_len(ws[t])) else ws[t])
+                t += 1
+            end
+            in_desc = false
+            continue
+        end
+        let v5: string = label_val(line, "Installed:")
+        if v5 != "" is
+            let val: string = string_slice(v5, 1, string_len(v5))
+            if val != "No" is
+                let w: [string] = words(val)
+                if array_len(w) > 0 is installed = w[0] end
+            end
+            in_desc = false
+            continue
+        end
+        if line == "Description:" is
+            in_desc = true
+            continue
+        end
+        if in_desc is
+            if line == "" is
+                in_desc = false
+                continue
+            end
+            desc_lines = array_push(desc_lines, line)
+        end
+    end
+    let description: string = iter_join(desc_lines, " ")
+    let r = jx::ob()
+    jx::p_opt(r, "version", version, version != "")
+    jx::p_str(r, "summary", take_chars(description, 160))
+    jx::p_str(r, "description", description)
+    jx::p_opt(r, "license", license, license != "")
+    jx::p_opt(r, "authors", authors, authors != "")
+    jx::p_strs(r, "tags", tags)
+    jx::p_opt(r, "installed_version", installed, installed != "")
+    return jx::ob_end(r)
+end
+
+fn string_trim_left_ws(s: string) -> string is
+    let mut i: int = 0
+    while i < string_len(s) && (byte_at(s, i) == 32 || byte_at(s, i) == 9) is i += 1 end
+    return string_slice(s, i, string_len(s))
+end
+
+pub fn installed_names() -> [string] is
+    let bin: string = hpm_bin()
+    if bin == "" is return [] end
+    let o: shx::Out = shx::run_timeout([bin, "list"], 6)
+    if !o.spawned || o.timed_out is return [] end
+    let lines: [string] = shx::lines_of(o.stdout)
+    let mut out: [string] = []
+    let mut i: int = 2
+    while i < array_len(lines) is
+        let t: string = string_trim(lines[i])
+        i += 1
+        if t == "" || string_starts_with(t, "Package") is continue end
+        let w: [string] = words(t)
+        if array_len(w) > 0 is out = array_push(out, w[0]) end
+    end
+    return out
+end
+
+pub fn install(spec_in: string) -> shx::Res is
+    let v: shx::Res = security::validate_pkg_token(spec_in)
+    if !v.ok is return v end
+    let spec: string = v.val
+    let bin: string = hpm_bin()
+    if bin == "" is return shx::fail("hpm is not installed on this system (expected /usr/bin/hpm).") end
+    shx::emit_log("info", "Installing " + spec + " via hpm (HackerOS Community Repository)...")
+    shx::emit_prog("install", "Installing " + spec + "...", 0.2)
+    let r: shx::Res = shx::run_streaming([bin, "install", spec])
+    if !r.ok is return r end
+    shx::emit_prog("done", "Done!", 1.0)
+    return shx::ok_unit()
+end
+
+pub fn remove(spec_in: string) -> shx::Res is
+    let v: shx::Res = security::validate_pkg_token(spec_in)
+    if !v.ok is return v end
+    let spec: string = v.val
+    let bin: string = hpm_bin()
+    if bin == "" is return shx::fail("hpm is not installed on this system (expected /usr/bin/hpm).") end
+    shx::emit_log("info", "Removing " + spec + " via hpm...")
+    shx::emit_prog("uninstall", "Removing " + spec + "...", 0.3)
+    let r: shx::Res = shx::run_streaming([bin, "remove", spec])
+    if !r.ok is return r end
+    shx::emit_prog("done", "Removed.", 1.0)
+    return shx::ok_unit()
+end
+
+pub fn rollback(package_in: string) -> shx::Res is
+    let v: shx::Res = security::validate_pkg_token(package_in)
+    if !v.ok is return v end
+    let package: string = v.val
+    let bin: string = hpm_bin()
+    if bin == "" is return shx::fail("hpm is not installed on this system (expected /usr/bin/hpm).") end
+    shx::emit_log("info", "Rolling back " + package + " via hpm...")
+    let r: shx::Res = shx::run_streaming([bin, "rollback", package])
+    if !r.ok is return r end
+    return shx::ok("Rolled " + package + " back to its previous state via hpm.")
+end
