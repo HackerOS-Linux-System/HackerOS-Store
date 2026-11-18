@@ -1,0 +1,97 @@
+fn nl(sb: any, depth: int) is
+    sb_push(sb, "\n")
+    let mut i: int = 0
+    while i < depth is
+        sb_push(sb, "  ")
+        i += 1
+    end
+end
+
+fn next_nonws(s: string, from: int) -> int is
+    let n: int = string_len(s)
+    let mut j: int = from
+    while j < n is
+        let b: int = byte_at(s, j)
+        if b == 32 || b == 10 || b == 9 || b == 13 is
+            j += 1
+        else is
+            return j
+        end
+    end
+    return n
+end
+
+pub fn pretty(raw: string) -> string is
+    let n: int = string_len(raw)
+    let sb = sb_new()
+    let mut depth: int = 0
+    let mut i: int = 0
+    while i < n is
+        let b: int = byte_at(raw, i)
+        if b == 34 is
+            let mut j: int = i + 1
+            while j < n && byte_at(raw, j) != 34 is
+                if byte_at(raw, j) == 92 is j += 1 end
+                j += 1
+            end
+            sb_push(sb, string_slice(raw, i, j + 1))
+            i = j + 1
+        elsif b == 32 || b == 10 || b == 9 || b == 13 is
+            i += 1
+        elsif b == 123 || b == 91 is
+            let k: int = next_nonws(raw, i + 1)
+            let close: int = if b == 123 then 125 else 93
+            if k < n && byte_at(raw, k) == close is
+                sb_push(sb, string_slice(raw, i, i + 1))
+                sb_push(sb, string_slice(raw, k, k + 1))
+                i = k + 1
+            else is
+                sb_push(sb, string_slice(raw, i, i + 1))
+                depth += 1
+                nl(sb, depth)
+                i += 1
+            end
+        elsif b == 125 || b == 93 is
+            depth -= 1
+            nl(sb, depth)
+            sb_push(sb, string_slice(raw, i, i + 1))
+            i += 1
+        elsif b == 44 is
+            sb_push(sb, ",")
+            nl(sb, depth)
+            i += 1
+        elsif b == 58 is
+            sb_push(sb, ": ")
+            i += 1
+        else is
+            ;; run of literal chars (number/true/false/null)
+            let mut j: int = i
+            while j < n is
+                let c: int = byte_at(raw, j)
+                if c == 44 || c == 125 || c == 93 || c == 32 || c == 10 || c == 9 || c == 13 || c == 58 is
+                    break
+                end
+                j += 1
+            end
+            sb_push(sb, string_slice(raw, i, j))
+            i = j
+        end
+    end
+    return sb_build(sb)
+end
+
+;; Rust `s.chars().take(n).collect::<String>()` (UTF-8 aware)
+pub fn take_chars(s: string, n: int) -> string is
+    let len: int = string_len(s)
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < len is
+        let b: int = byte_at(s, i)
+        if b < 128 || b >= 192 is
+            if count == n is return string_slice(s, 0, i) end
+            count += 1
+        end
+        i += 1
+    end
+    return s
+end
