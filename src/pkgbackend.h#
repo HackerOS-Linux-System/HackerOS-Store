@@ -1,0 +1,540 @@
+use "std -> process" from "proc"
+use "std -> fs"      from "fs"
+use "std -> env"     from "env"
+mod jx
+mod shx
+mod kv
+
+pub struct PkgVer is
+    pub name:    string
+    pub version: string
+end
+
+const NO_BACKEND: string = "Neither apt-get nor hammer is installed on this system."
+
+;; ── pomocnicze ──
+fn is_digits(s: string) -> bool is
+    if string_len(s) == 0 is return false end
+    let mut i: int = 0
+    while i < string_len(s) is
+        let b: int = byte_at(s, i)
+        if b < 48 || b > 57 is return false end
+        i += 1
+    end
+    return true
+end
+
+fn ws_split(s: string) -> [string] is
+    let t: string = string_replace(string_replace(string_replace(s, "\t", " "), "\r", " "), "\n", " ")
+    let parts: [string] = str_split(t, " ")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] != "" is out = array_push(out, parts[i]) end
+        i += 1
+    end
+    return out
+end
+
+fn drop_marks(s: string) -> string is
+    let mut t: string = s
+    let mut go: bool = true
+    while go is
+        if string_starts_with(t, "●") is
+            t = string_slice(t, 3, string_len(t))
+        elsif string_starts_with(t, "○") is
+            t = string_slice(t, 3, string_len(t))
+        else is
+            go = false
+        end
+    end
+    return t
+end
+
+fn dr(name: string, version: string, desc: string) -> string is
+    let o = jx::ob()
+    jx::p_str(o, "name", name)
+    jx::p_str(o, "version", version)
+    jx::p_str(o, "desc", desc)
+    jx::p_str(o, "source", "apt")
+    jx::p_str(o, "package_id", name)
+    jx::p_null(o, "size")
+    jx::p_null(o, "icon")
+    return jx::ob_end(o)
+end
+
+fn issue(source: string, kind: string, message: string) -> shx::Res is
+    let o = jx::ob()
+    jx::p_str(o, "source", source)
+    jx::p_str(o, "kind", kind)
+    jx::p_str(o, "message", message)
+    return shx::fail(jx::ob_end(o))
+end
+
+fn is_str_raw(raw: string) -> bool is
+    let t: string = string_trim(raw)
+    return string_len(t) >= 2 && string_starts_with(t, "\"")
+end
+
+;; ── backend / tryb ──
+pub fn on_path(bin: string) -> bool is
+    return shx::has(bin)
+end
+
+;; "" gdy brak
+pub fn hammer_bin() -> string is
+    if fs::is_file("/usr/bin/hammer") is return "/usr/bin/hammer" end
+    if on_path("hammer") is return "hammer" end
+    return ""
+end
+
+pub fn hammer_bin_pub() -> string is
+    return hammer_bin()
+end
+
+;; "apt" | "hammer"
+pub fn backend() -> string is
+    if on_path("apt-get") is return "apt" end
+    if hammer_bin() != "" is return "hammer" end
+    return "apt"
+end
+
+pub fn is_available() -> bool is
+    if backend() == "apt" is return on_path("apt-get") end
+    return hammer_bin() != ""
+end
+
+pub fn backend_label() -> string is
+    return backend()
+end
+
+;; "normal" | "oci"
+pub fn hammer_mode() -> string is
+    let v: string = string_lower(string_trim(env::get("HACKEROS_HAMMER_MODE")))
+    if v == "oci" is return "oci" end
+    if v == "normal" || v == "classic" is return "normal" end
+    let bin: string = hammer_bin()
+    if bin == "" is return "normal" end
+    let o: shx::Out = shx::run([bin, "oci", "status"])
+    if o.spawned && o.code == 0 is return "oci" end
+    return "normal"
+end
+
+pub fn backend_display_label() -> string is
+    if backend() == "apt" is return "apt" end
+    if hammer_mode() == "oci" is return "hammer (oci)" end
+    return "hammer (normal)"
+end
+
+;; ── mutacje ──
+pub fn install(pkgs: [string]) -> shx::Res is
+    if array_len(pkgs) == 0 is return shx::ok_unit() end
+    if backend() == "apt" is
+        return shx::priv_run(array_concat(["apt-get", "install", "-y", "--no-install-recommends"], pkgs))
+    end
+    let bin: string = hammer_bin()
+    if bin == "" is return shx::fail(NO_BACKEND) end
+    if hammer_mode() == "normal" is
+        return shx::priv_run(array_concat([bin, "install", "-y", "--no-recommends"], pkgs))
+    end
+    let r: shx::Res = shx::priv_run(array_concat([bin, "oci", "install"], pkgs))
+    if !r.ok is return r end
+    shx::emit_log("info", "hammer oci: package layered onto a new deployment — reboot to activate it.")
+    return shx::ok_unit()
+end
+
+pub fn remove(pkgs: [string]) -> shx::Res is
+    if array_len(pkgs) == 0 is return shx::ok_unit() end
+    if backend() == "apt" is
+        return shx::priv_run(array_concat(["apt-get", "remove", "-y"], pkgs))
+    end
+    let bin: string = hammer_bin()
+    if bin == "" is return shx::fail(NO_BACKEND) end
+    if hammer_mode() == "normal" is
+        return shx::priv_run(array_concat([bin, "remove", "-y"], pkgs))
+    end
+    let r: shx::Res = shx::priv_run(array_concat([bin, "oci", "uninstall"], pkgs))
+    if !r.ok is return r end
+    shx::emit_log("info", "hammer oci: package removed from a new deployment — reboot to activate it.")
+    return shx::ok_unit()
+end
+
+pub fn update_index() -> shx::Res is
+    if backend() == "apt" is return shx::priv_run(["apt-get", "update", "-qq"]) end
+    let bin: string = hammer_bin()
+    if bin == "" is return shx::fail(NO_BACKEND) end
+    if hammer_mode() == "normal" is return shx::priv_run([bin, "sync"]) end
+    return shx::priv_run([bin, "oci", "update"])
+end
+
+;; Best-effort w trybie hammer (błąd ignorowany) — jak w Rust.
+pub fn clean() -> shx::Res is
+    if backend() == "apt" is return shx::priv_run(["apt-get", "clean"]) end
+    let bin: string = hammer_bin()
+    if bin == "" is return shx::ok_unit() end
+    if hammer_mode() == "normal" is
+        shx::priv_run([bin, "clean"])
+    else is
+        shx::priv_run([bin, "oci", "cleanup"])
+    end
+    return shx::ok_unit()
+end
+
+pub fn downgrade_to(package_id: string, version: string) -> shx::Res is
+    let spec: string = package_id + "=" + version
+    if backend() == "apt" is
+        return shx::priv_run(["apt-get", "install", "-y", "--allow-downgrades", spec])
+    end
+    let bin: string = hammer_bin()
+    if bin == "" is return shx::fail(NO_BACKEND) end
+    if hammer_mode() == "normal" is
+        return shx::priv_run([bin, "install", "-y", spec])
+    end
+    return shx::fail("hammer oci mode doesn't support pinning a single package (" + package_id + ") back to an older version — packages are layered onto whole deployments instead. Use 'hammer oci rollback' to return to the previous deployment as a whole, or 'hammer oci status' to see what's available.")
+end
+
+pub fn add_foreign_arch(arch: string) -> shx::Res is
+    if backend() == "apt" is
+        return shx::priv_run(["dpkg", "--add-architecture", arch])
+    end
+    let bin: string = hammer_bin()
+    if bin == "" is return shx::fail(NO_BACKEND) end
+    if hammer_mode() == "normal" is
+        return shx::priv_run([bin, "dpkg-arch", "add", arch])
+    end
+    return shx::fail("hammer oci mode doesn't support adding a foreign architecture (" + arch + ") — the OSTree base image is single-arch by design.")
+end
+
+;; ── zapytania: search ──
+;; run_timeout_reported: ok => stdout w Res.val; !ok => err = JSON SourceIssue
+fn reported(argv: [string], secs: int, source: string) -> shx::Res is
+    let o: shx::Out = shx::run_timeout(argv, secs)
+    if o.timed_out is
+        return issue(source, "timeout", source + " did not respond within " + to_string(secs) + "s.")
+    end
+    if !o.spawned is
+        return issue(source, "unavailable", source + " is not installed on this system.")
+    end
+    return shx::ok(o.stdout)
+end
+
+pub fn search(query: string) -> shx::Res is
+    if backend() == "apt" is return search_apt(query) end
+    if hammer_mode() == "normal" is return search_hammer_normal(query) end
+    return search_hammer_oci(query)
+end
+
+fn search_apt(query: string) -> shx::Res is
+    let r: shx::Res = reported(["apt-cache", "search", "--names-only", query], 4, "apt")
+    if !r.ok is return r end
+    let lines: [string] = shx::lines_of(r.val)
+    let mut names: [string] = []
+    let mut descs: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) && i < 14 is
+        let l: string = lines[i]
+        i += 1
+        let p: int = string_find(l, " - ")
+        let n: string = string_trim(if p < 0 then l else string_slice(l, 0, p))
+        let d: string = if p < 0 then "" else string_trim(string_slice(l, p + 3, string_len(l)))
+        if n == "" is continue end
+        names = array_push(names, n)
+        descs = array_push(descs, d)
+    end
+    if array_len(names) == 0 is return shx::ok("[]") end
+    let dp: shx::Out = shx::run_timeout(array_concat(["dpkg-query", "-W", "-f=${{Package}} ${{Version}}\n"], names), 3)
+    let mut tsv: string = ""
+    if dp.spawned && !dp.timed_out is
+        let dl: [string] = shx::lines_of(dp.stdout)
+        let mut j: int = 0
+        while j < array_len(dl) is
+            let l: string = dl[j]
+            j += 1
+            let p: int = string_find(l, " ")
+            if p < 0 is
+                tsv = tsv + l + "\t\n"
+            else is
+                tsv = tsv + string_slice(l, 0, p) + "\t" + string_slice(l, p + 1, string_len(l)) + "\n"
+            end
+        end
+    end
+    let vm: kv::Kv = kv::from_tsv(tsv)
+    let mut items: [string] = []
+    let mut k: int = 0
+    while k < array_len(names) is
+        items = array_push(items, dr(names[k], kv::get(vm, names[k]), descs[k]))
+        k += 1
+    end
+    return shx::ok(jx::arr_raw(items))
+end
+
+fn search_hammer_normal(query: string) -> shx::Res is
+    let bin: string = hammer_bin()
+    if bin == "" is
+        return issue("apt", "unavailable", "hammer is not installed on this system (expected /usr/bin/hammer).")
+    end
+    let r: shx::Res = reported([bin, "search", query, "--json"], 8, "apt")
+    if !r.ok is return r end
+    let items: [string] = jx::array_items(r.val)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) && i < 14 is
+        let v: string = items[i]
+        i += 1
+        let nraw: string = jx::get_raw(v, "name")
+        if !is_str_raw(nraw) is continue end
+        let name: string = jx::raw_to_str(nraw)
+        let vr: string = jx::get_raw(v, "version")
+        let sr: string = jx::get_raw(v, "summary")
+        let version: string = if is_str_raw(vr) then jx::raw_to_str(vr) else ""
+        let desc: string = if is_str_raw(sr) then jx::raw_to_str(sr) else ""
+        out = array_push(out, dr(name, version, desc))
+    end
+    return shx::ok(jx::arr_raw(out))
+end
+
+fn search_hammer_oci(query: string) -> shx::Res is
+    let bin: string = hammer_bin()
+    if bin == "" is
+        return issue("apt", "unavailable", "hammer is not installed on this system (expected /usr/bin/hammer).")
+    end
+    let r: shx::Res = reported([bin, "oci", "search", query], 10, "apt")
+    if !r.ok is return r end
+    let lines: [string] = shx::lines_of(r.val)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) && array_len(out) < 14 is
+        let t: string = string_trim(lines[i])
+        i += 1
+        if t == "" || string_starts_with(t, "No packages") is continue end
+        let p: int = string_find(t, "—")
+        let head: string = string_trim(if p < 0 then t else string_slice(t, 0, p))
+        let desc: string = if p < 0 then "" else string_trim(string_slice(t, p + 3, string_len(t)))
+        let parts: [string] = ws_split(head)
+        if array_len(parts) == 0 is continue end
+        let version: string = if array_len(parts) > 1 then parts[1] else ""
+        out = array_push(out, dr(parts[0], version, desc))
+    end
+    return shx::ok(jx::arr_raw(out))
+end
+
+;; ── show_info ──
+fn info_json(desc: string, has_desc: bool, size: string, has_size: bool, version: string, has_ver: bool) -> string is
+    let o = jx::ob()
+    jx::p_opt(o, "description", desc, has_desc)
+    jx::p_opt(o, "size", size, has_size)
+    jx::p_opt(o, "version", version, has_ver)
+    return jx::ob_end(o)
+end
+
+pub fn show_info(name: string) -> string is
+    if backend() == "apt" is return show_info_apt(name) end
+    if hammer_mode() == "normal" is return show_info_hammer_normal(name) end
+    return show_info_hammer_oci(name)
+end
+
+fn show_info_apt(name: string) -> string is
+    let mut desc: string = ""
+    let mut hd: bool = false
+    let mut size: string = ""
+    let mut hs: bool = false
+    let mut ver: string = ""
+    let mut hv: bool = false
+    let o: shx::Out = shx::run_timeout(["apt-cache", "show", "--no-all-versions", name], 4)
+    if o.spawned && !o.timed_out is
+        let lines: [string] = shx::lines_of(o.stdout)
+        let mut i: int = 0
+        while i < array_len(lines) is
+            let line: string = lines[i]
+            i += 1
+            if string_starts_with(line, "Version:") is
+                ver = string_trim(string_slice(line, 8, string_len(line)))
+                hv = true
+            end
+            if string_starts_with(line, "Size:") || string_starts_with(line, "Installed-Size:") is
+                let parts: [string] = ws_split(line)
+                let last: string = if array_len(parts) == 0 then "0" else parts[array_len(parts) - 1]
+                let kb: int = if is_digits(last) then str_to_int(last) else 0
+                if kb > 1024 is
+                    let tenths: int = (kb * 20 + 1024) / 2048
+                    size = to_string(tenths / 10) + "." + to_string(tenths % 10) + " MB"
+                else is
+                    size = to_string(kb) + " KB"
+                end
+                hs = true
+            end
+            if string_starts_with(line, "Description-en:") is
+                desc = string_trim(string_slice(line, 15, string_len(line)))
+                hd = true
+            elsif string_starts_with(line, "Description:") is
+                desc = string_trim(string_slice(line, 12, string_len(line)))
+                hd = true
+            end
+        end
+    end
+    return info_json(desc, hd, size, hs, ver, hv)
+end
+
+fn show_info_hammer_normal(name: string) -> string is
+    let bin: string = hammer_bin()
+    if bin == "" is return info_json("", false, "", false, "", false) end
+    let o: shx::Out = shx::run_timeout([bin, "info", name, "--json"], 6)
+    let mut desc: string = ""
+    let mut hd: bool = false
+    let mut ver: string = ""
+    let mut hv: bool = false
+    if o.spawned && !o.timed_out is
+        let t: string = string_trim(o.stdout)
+        if string_starts_with(t, "{") is
+            let vr: string = jx::get_raw(t, "version")
+            let dr2: string = jx::get_raw(t, "description")
+            if is_str_raw(vr) is
+                ver = jx::raw_to_str(vr)
+                hv = true
+            end
+            if is_str_raw(dr2) is
+                desc = jx::raw_to_str(dr2)
+                hd = true
+            end
+        end
+    end
+    return info_json(desc, hd, "", false, ver, hv)
+end
+
+fn show_info_hammer_oci(name: string) -> string is
+    let bin: string = hammer_bin()
+    if bin == "" is return info_json("", false, "", false, "", false) end
+    let o: shx::Out = shx::run_timeout([bin, "oci", "search", name], 8)
+    let mut desc: string = ""
+    let mut hd: bool = false
+    let mut ver: string = ""
+    let mut hv: bool = false
+    if o.spawned && !o.timed_out is
+        let lines: [string] = shx::lines_of(o.stdout)
+        let mut i: int = 0
+        while i < array_len(lines) is
+            let t: string = string_trim(lines[i])
+            i += 1
+            let p: int = string_find(t, "—")
+            if p < 0 is continue end
+            let parts: [string] = ws_split(string_trim(string_slice(t, 0, p)))
+            if array_len(parts) == 0 is continue end
+            if parts[0] != name is continue end
+            if array_len(parts) > 1 is
+                ver = parts[1]
+                hv = true
+            end
+            desc = string_trim(string_slice(t, p + 3, string_len(t)))
+            hd = true
+            break
+        end
+    end
+    return info_json(desc, hd, "", false, ver, hv)
+end
+
+;; ── zainstalowane ──
+pub fn installed_names() -> [string] is
+    if backend() == "apt" is
+        let o: shx::Out = shx::run_timeout(["dpkg-query", "-W", "-f=${{Package}}\n"], 4)
+        if !o.spawned || o.timed_out is return [] end
+        return shx::lines_of(o.stdout)
+    end
+    return installed_map().keys
+end
+
+pub fn installed_map() -> kv::Kv is
+    let mut tsv: string = ""
+    if backend() == "apt" is
+        let o: shx::Out = shx::run_timeout(["dpkg-query", "-W", "-f=${{Package}} ${{Version}}\n"], 4)
+        if o.spawned && !o.timed_out is
+            let sb = sb_new()
+            let lines: [string] = shx::lines_of(o.stdout)
+            let mut i: int = 0
+            while i < array_len(lines) is
+                let l: string = lines[i]
+                i += 1
+                let p: int = string_find(l, " ")
+                if p < 0 is
+                    sb_push(sb, l + "\t\n")
+                else is
+                    sb_push(sb, string_slice(l, 0, p) + "\t" + string_trim(string_slice(l, p + 1, string_len(l))) + "\n")
+                end
+            end
+            tsv = sb_build(sb)
+        end
+        return kv::from_tsv(tsv)
+    end
+    let bin: string = hammer_bin()
+    if bin == "" is return kv::empty() end
+    if hammer_mode() == "normal" is
+        let o: shx::Out = shx::run_timeout([bin, "list", "--installed", "--json"], 6)
+        if o.spawned && !o.timed_out is
+            let items: [string] = jx::array_items(o.stdout)
+            let sb = sb_new()
+            let mut i: int = 0
+            while i < array_len(items) is
+                let p: string = items[i]
+                i += 1
+                let nr: string = jx::get_raw(p, "name")
+                let vr: string = jx::get_raw(p, "version")
+                if !is_str_raw(nr) || !is_str_raw(vr) is continue end
+                sb_push(sb, jx::raw_to_str(nr) + "\t" + jx::raw_to_str(vr) + "\n")
+            end
+            tsv = sb_build(sb)
+        end
+    else is
+        let o: shx::Out = shx::run_timeout([bin, "oci", "list"], 6)
+        if o.spawned && !o.timed_out is
+            let lines: [string] = shx::lines_of(o.stdout)
+            let sb = sb_new()
+            let mut i: int = 0
+            while i < array_len(lines) is
+                let t: string = string_trim(drop_marks(lines[i]))
+                i += 1
+                let parts: [string] = ws_split(t)
+                if array_len(parts) < 2 is continue end
+                sb_push(sb, parts[0] + "\t" + parts[1] + "\n")
+            end
+            tsv = sb_build(sb)
+        end
+    end
+    return kv::from_tsv(tsv)
+end
+
+;; "" = None
+pub fn installed_version(package_id: string) -> string is
+    if backend() == "apt" is
+        let o: shx::Out = shx::run(["dpkg-query", "-W", "-f=${{Version}}", package_id])
+        if !o.spawned || o.code != 0 is return "" end
+        return string_trim(o.stdout)
+    end
+    let m: kv::Kv = installed_map()
+    return kv::get(m, package_id)
+end
+
+pub fn installed_versions(package_ids: [string]) -> [PkgVer] is
+    let m: kv::Kv = installed_map()
+    let mut out: [PkgVer] = []
+    let mut i: int = 0
+    while i < array_len(package_ids) is
+        if kv::has(m, package_ids[i]) is
+            out = array_push(out, PkgVer { name: package_ids[i], version: kv::get(m, package_ids[i]) })
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn upgradable_count() -> int is
+    if backend() == "apt" is
+        let o: shx::Out = shx::run_sh("apt list --upgradable 2>/dev/null | grep -c upgradable", 0)
+        let t: string = string_trim(o.stdout)
+        return if is_digits(t) then str_to_int(t) else 0
+    end
+    if hammer_mode() == "oci" is return 0 end
+    let bin: string = hammer_bin()
+    if bin == "" is return 0 end
+    let o: shx::Out = shx::run_timeout([bin, "list", "--upgrades", "--json"], 6)
+    if !o.spawned || o.timed_out is return 0 end
+    return array_len(jx::array_items(o.stdout))
+end
