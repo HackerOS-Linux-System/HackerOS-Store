@@ -1,0 +1,66 @@
+mod shx
+mod appimage
+mod avail
+mod ccmds
+mod discover
+mod history
+mod hnm
+mod queue_store
+mod ratings
+mod settings
+
+pub fn dispatch(cmd: string, args: string) -> shx::Res is
+    if cmd == "refresh_appimage_feed" is return appimage::cmd_refresh_appimage_feed(args) end
+    if cmd == "is_brew_available" is return avail::cmd_is_brew_available(args) end
+    if cmd == "is_flatpak_available" is return avail::cmd_is_flatpak_available(args) end
+    if cmd == "is_snap_available" is return avail::cmd_is_snap_available(args) end
+    if cmd == "is_hacker_available" is return avail::cmd_is_hacker_available(args) end
+    if cmd == "is_podman_available" is return avail::cmd_is_podman_available(args) end
+    if cmd == "is_hpm_available" is return avail::cmd_is_hpm_available(args) end
+    if cmd == "is_nix_available" is return avail::cmd_is_nix_available(args) end
+    if cmd == "is_apt_available" is return avail::cmd_is_apt_available(args) end
+    if cmd == "get_app_info" is return avail::cmd_get_app_info(args) end
+    if cmd == "clear_cache" is return avail::cmd_clear_cache(args) end
+    if cmd == "check_all_installed" is return ccmds::cmd_check_all_installed(args) end
+    if cmd == "get_package_info" is return ccmds::cmd_get_package_info(args) end
+    if cmd == "check_updates_available" is return ccmds::cmd_check_updates_available(args) end
+    if cmd == "install_package" is return ccmds::cmd_install_package(args) end
+    if cmd == "uninstall_package" is return ccmds::cmd_uninstall_package(args) end
+    if cmd == "update_system" is return ccmds::cmd_update_system(args) end
+    if cmd == "discover_categories" is return discover::cmd_discover_categories(args) end
+    if cmd == "discover_browse" is return discover::cmd_discover_browse(args) end
+    if cmd == "discover_search" is return discover::cmd_discover_search(args) end
+    if cmd == "discover_install" is return discover::cmd_discover_install(args) end
+    if cmd == "discover_uninstall" is return discover::cmd_discover_uninstall(args) end
+    if cmd == "get_installed_sets" is return discover::cmd_get_installed_sets(args) end
+    if cmd == "get_app_details" is return discover::cmd_get_app_details(args) end
+    if cmd == "get_install_history" is return history::cmd_get_install_history(args) end
+    if cmd == "clear_install_history" is return history::cmd_clear_install_history(args) end
+    if cmd == "rollback_history_entry" is return history::cmd_rollback_history_entry(args) end
+    if cmd == "nix_list_generations" is return hnm::cmd_nix_list_generations(args) end
+    if cmd == "nix_store_size" is return hnm::cmd_nix_store_size(args) end
+    if cmd == "nix_list_installed" is return hnm::cmd_nix_list_installed(args) end
+    if cmd == "nix_env_status" is return hnm::cmd_nix_env_status(args) end
+    if cmd == "nix_doctor" is return hnm::cmd_nix_doctor(args) end
+    if cmd == "nix_check" is return hnm::cmd_nix_check(args) end
+    if cmd == "nix_which" is return hnm::cmd_nix_which(args) end
+    if cmd == "nix_rollback" is return hnm::cmd_nix_rollback(args) end
+    if cmd == "nix_pin" is return hnm::cmd_nix_pin(args) end
+    if cmd == "nix_unpin" is return hnm::cmd_nix_unpin(args) end
+    if cmd == "nix_gc" is return hnm::cmd_nix_gc(args) end
+    if cmd == "nix_clean" is return hnm::cmd_nix_clean(args) end
+    if cmd == "nix_update_index" is return hnm::cmd_nix_update_index(args) end
+    if cmd == "nix_env_activate" is return hnm::cmd_nix_env_activate(args) end
+    if cmd == "nix_env_deactivate" is return hnm::cmd_nix_env_deactivate(args) end
+    if cmd == "get_persisted_queue" is return queue_store::cmd_get_persisted_queue(args) end
+    if cmd == "save_persisted_queue" is return queue_store::cmd_save_persisted_queue(args) end
+    if cmd == "submit_rating" is return ratings::cmd_submit_rating(args) end
+    if cmd == "get_local_rating" is return ratings::cmd_get_local_rating(args) end
+    if cmd == "get_reviews" is return ratings::cmd_get_reviews(args) end
+    if cmd == "get_settings" is return settings::cmd_get_settings(args) end
+    if cmd == "save_settings" is return settings::cmd_save_settings(args) end
+    if cmd == "reset_settings" is return settings::cmd_reset_settings(args) end
+    if cmd == "export_settings_snapshot" is return settings::cmd_export_settings_snapshot(args) end
+    if cmd == "import_settings_snapshot" is return settings::cmd_import_settings_snapshot(args) end
+    return shx::fail("unknown command: " + cmd)
+end
