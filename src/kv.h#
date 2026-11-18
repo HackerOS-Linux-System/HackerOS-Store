@@ -1,0 +1,66 @@
+pub struct Kv is
+    pub keys: [string]
+    pub vals: [string]
+    pub idx:  string        ;; "\u0001k1\u0001k2\u0001"
+end
+
+pub fn empty() -> Kv is
+    return Kv { keys: [], vals: [], idx: "" }
+end
+
+;; vals może być krótsze niż keys (wtedy to zbiór)
+pub fn from_pairs(keys: [string], vals: [string]) -> Kv is
+    let sb = sb_new()
+    sb_push(sb, "\u0001")
+    let mut i: int = 0
+    while i < array_len(keys) is
+        sb_push(sb, keys[i])
+        sb_push(sb, "\u0001")
+        i += 1
+    end
+    return Kv { keys: keys, vals: vals, idx: sb_build(sb) }
+end
+
+pub fn from_keys(keys: [string]) -> Kv is
+    return from_pairs(keys, [])
+end
+
+;; Tekst z liniami "klucz<TAB>wartość" (wartość opcjonalna). Puste klucze pomijane. Późniejszy duplikat nie nadpisuje.
+pub fn from_tsv(text: string) -> Kv is
+    let lines: [string] = str_split(text, "\n")
+    let mut keys: [string] = []
+    let mut vals: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let line: string = lines[i]
+        i += 1
+        let tab: int = string_find(line, "\t")
+        let k: string = string_trim(if tab < 0 then line else string_slice(line, 0, tab))
+        if k == "" is continue end
+        let v: string = if tab < 0 then "" else string_trim(string_slice(line, tab + 1, string_len(line)))
+        keys = array_push(keys, k)
+        vals = array_push(vals, v)
+    end
+    return from_pairs(keys, vals)
+end
+
+pub fn has(m: Kv, key: string) -> bool is
+    return string_find(m.idx, "\u0001" + key + "\u0001") >= 0
+end
+
+pub fn len(m: Kv) -> int is
+    return array_len(m.keys)
+end
+
+;; Wartość dla klucza ("" gdy brak — sprawdź has() gdy "" jest wartością legalną)
+pub fn get(m: Kv, key: string) -> string is
+    if !has(m, key) is return "" end
+    let mut i: int = 0
+    while i < array_len(m.keys) is
+        if m.keys[i] == key is
+            return if i < array_len(m.vals) then m.vals[i] else ""
+        end
+        i += 1
+    end
+    return ""
+end
