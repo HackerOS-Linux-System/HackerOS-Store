@@ -1,0 +1,481 @@
+use "std -> fs"  from "fs"
+use "std -> env" from "env"
+mod jx
+mod shx
+mod security
+mod cache
+mod hpm
+
+fn hnm_bin() -> string is
+    if fs::exists("/usr/bin/hnm") is return "/usr/bin/hnm" end
+    if shx::has("hnm") is return "hnm" end
+    return ""
+end
+
+pub fn is_available() -> bool is
+    return hnm_bin() != ""
+end
+
+fn unavailable_msg() -> string is
+    return "hnm is not installed on this system (expected /usr/bin/hnm)."
+end
+
+fn issue(kind: string, message: string) -> shx::Res is
+    let o = jx::ob()
+    jx::p_str(o, "source", "nix")
+    jx::p_str(o, "kind", kind)
+    jx::p_str(o, "message", message)
+    return shx::fail(jx::ob_end(o))
+end
+
+fn all_ws(s: string) -> bool is
+    return string_trim(s) == ""
+end
+
+pub fn search(query: string) -> shx::Res is
+    let bin: string = hnm_bin()
+    if bin == "" is return issue("unavailable", "hnm is not installed on this system (expected /usr/bin/hnm).") end
+    let o: shx::Out = shx::run_timeout([bin, "search", query, "--json"], 20)
+    if o.timed_out is
+        return issue("timeout", "hnm did not respond within 20s (first-run Nix bootstrap can be slow).")
+    end
+    if !o.spawned is return issue("timeout", "hnm did not respond within 20s (first-run Nix bootstrap can be slow).") end
+    if o.code != 0 is return issue("error", "hnm search failed: " + string_trim(o.stderr)) end
+    if all_ws(o.stdout) is
+        if string_contains(o.stderr, "package index not built") is
+            return issue("error", "Nix package index not built yet — run `hnm update` once (Settings → Maintenance, or a terminal) to enable nix search.")
+        end
+        return shx::ok("[]")
+    end
+    let t: string = string_trim(o.stdout)
+    if !string_starts_with(t, "[") is return issue("error", "could not parse hnm output: expected array") end
+    let items: [string] = jx::array_items(t)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) && i < 30 is
+        let p: string = items[i]
+        i += 1
+        let name: string = jx::get_str(p, "name")
+        let r = jx::ob()
+        jx::p_str(r, "name", name)
+        jx::p_str(r, "version", jx::get_str(p, "version"))
+        jx::p_str(r, "desc", jx::get_str(p, "description"))
+        jx::p_str(r, "source", "nix")
+        jx::p_str(r, "package_id", name)
+        jx::p_null(r, "size")
+        jx::p_null(r, "icon")
+        out = array_push(out, jx::ob_end(r))
+    end
+    return shx::ok(jx::arr_raw(out))
+end
+
+;; label z kolumny "  {:>16}  {}" — prefiks klucza + biały znak
+fn strip_label(line: string, label: string) -> string is
+    if !string_starts_with(line, label) is return "" end
+    let rest: string = string_slice(line, string_len(label), string_len(line))
+    if string_len(rest) == 0 is return "" end
+    let b: int = byte_at(rest, 0)
+    if !(b == 32 || b == 9) is return "" end
+    return "\u0001" + string_trim(rest)
+end
+
+fn ltrim(s: string) -> string is
+    let mut i: int = 0
+    while i < string_len(s) && (byte_at(s, i) == 32 || byte_at(s, i) == 9) is i += 1 end
+    return string_slice(s, i, string_len(s))
+end
+
+;; JSON {"version","summary","description","homepage","license"} albo "" gdy hnm niedostępny
+pub fn info(package: string) -> string is
+    let bin: string = hnm_bin()
+    if bin == "" is return "" end
+    let o: shx::Out = shx::run_timeout([bin, "info", package], 10)
+    if !o.spawned || o.timed_out is return "" end
+    let mut version: string = ""
+    let mut desc: string = ""
+    let mut homepage: string = ""
+    let mut license: string = ""
+    let lines: [string] = shx::lines_of(o.stdout)
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let line: string = ltrim(lines[i])
+        i += 1
+        let a: string = strip_label(line, "description")
+        if a != "" is
+            desc = string_slice(a, 1, string_len(a))
+            continue
+        end
+        let b: string = strip_label(line, "homepage")
+        if b != "" is
+            homepage = string_slice(b, 1, string_len(b))
+            continue
+        end
+        let c: string = strip_label(line, "license")
+        if c != "" is
+            license = string_slice(c, 1, string_len(c))
+            continue
+        end
+        let d: string = strip_label(line, "version")
+        if d != "" is
+            version = string_slice(d, 1, string_len(d))
+            continue
+        end
+    end
+    let r = jx::ob()
+    jx::p_opt(r, "version", version, version != "")
+    jx::p_str(r, "summary", hpm::take_chars(desc, 160))
+    jx::p_str(r, "description", desc)
+    jx::p_opt(r, "homepage", homepage, homepage != "")
+    jx::p_opt(r, "license", license, license != "")
+    return jx::ob_end(r)
+end
+
+;; ── zainstalowane ──
+;; JSON tablica NixInstalledPkg {name,version,attr_path,installed_at,pinned,description}
+pub fn list_installed() -> string is
+    let bin: string = hnm_bin()
+    if bin == "" is return "[]" end
+    let o: shx::Out = shx::run_timeout([bin, "list", "-i", "--json"], 8)
+    if !o.spawned || o.timed_out || o.code != 0 || all_ws(o.stdout) is return "[]" end
+    let t: string = string_trim(o.stdout)
+    if !string_starts_with(t, "[") is return "[]" end
+    let items: [string] = jx::array_items(t)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        let p: string = items[i]
+        i += 1
+        if jx::get_raw(p, "name") == "" is continue end
+        let r = jx::ob()
+        jx::p_str(r, "name", jx::get_str(p, "name"))
+        jx::p_str(r, "version", jx::get_str(p, "version"))
+        jx::p_str(r, "attr_path", jx::get_str(p, "attr_path"))
+        jx::p_str(r, "installed_at", jx::get_str(p, "installed_at"))
+        jx::p_raw(r, "pinned", if jx::raw_is_null(jx::get_raw(p, "pinned")) then "null" else jx::quote(jx::get_str(p, "pinned")))
+        jx::p_raw(r, "description", if jx::raw_is_null(jx::get_raw(p, "description")) then "null" else jx::quote(jx::get_str(p, "description")))
+        out = array_push(out, jx::ob_end(r))
+    end
+    return jx::arr_raw(out)
+end
+
+pub fn installed_names() -> [string] is
+    let items: [string] = jx::array_items(list_installed())
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        out = array_push(out, jx::get_str(items[i], "name"))
+        i += 1
+    end
+    return out
+end
+
+;; ── generacje ──
+fn hnm_profile_dir() -> string is
+    return shx::home() + "/.hnm/profile"
+end
+
+fn augmented_path() -> string is
+    let home: string = shx::home()
+    return home + "/.hnm/profile/bin:" + home + "/.nix-profile/bin:/nix/var/nix/profiles/default/bin:" + env::get("PATH")
+end
+
+;; Res: ok => val = JSON tablica NixGeneration {generation,date,current}
+pub fn list_generations() -> shx::Res is
+    let o: shx::Out = shx::run_env("PATH=" + shx::q(augmented_path()) + " ", ["nix-env", "--profile", hnm_profile_dir(), "--list-generations"], 10)
+    if o.timed_out is return shx::fail("nix-env did not respond within 10s.") end
+    if !o.spawned || o.code != 0 is return shx::ok("[]") end
+    let lines: [string] = shx::lines_of(o.stdout)
+    let mut gens: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let line: string = lines[i]
+        i += 1
+        let parts: [string] = words(line)
+        if array_len(parts) < 2 is continue end
+        if !is_uint(parts[0]) is continue end
+        let cur: bool = string_contains(line, "(current)")
+        let mut date: string = ""
+        let mut k: int = 1
+        while k < array_len(parts) is
+            if parts[k] != "(current)" is
+                date = if date == "" then parts[k] else date + " " + parts[k]
+            end
+            k += 1
+        end
+        let g = jx::ob()
+        jx::p_int(g, "generation", str_to_int(parts[0]))
+        jx::p_str(g, "date", date)
+        jx::p_bool(g, "current", cur)
+        gens = array_push(gens, jx::ob_end(g))
+    end
+    return shx::ok(jx::arr_raw(gens))
+end
+
+fn is_uint(s: string) -> bool is
+    if string_len(s) == 0 is return false end
+    let mut i: int = 0
+    while i < string_len(s) is
+        let b: int = byte_at(s, i)
+        if b < 48 || b > 57 is return false end
+        i += 1
+    end
+    return true
+end
+
+fn words(s: string) -> [string] is
+    let parts: [string] = str_split(string_replace(string_replace(s, "\t", " "), "\r", " "), " ")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] != "" is out = array_push(out, parts[i]) end
+        i += 1
+    end
+    return out
+end
+
+pub fn store_size() -> string is
+    let o: shx::Out = shx::run_timeout(["du", "-sh", "/nix/store"], 10)
+    if o.spawned && !o.timed_out && o.code == 0 is
+        let w: [string] = words(o.stdout)
+        if array_len(w) > 0 is return w[0] end
+        return "?"
+    end
+    return "?"
+end
+
+;; numer bieżącej generacji albo -1
+pub fn current_generation() -> int is
+    let r: shx::Res = list_generations()
+    if !r.ok is return -1 end
+    let items: [string] = jx::array_items(r.val)
+    let mut i: int = 0
+    while i < array_len(items) is
+        if jx::get_bool(items[i], "current") is return jx::get_int(items[i], "generation") end
+        i += 1
+    end
+    return -1
+end
+
+pub fn rollback(generation: int) -> shx::Res is
+    let bin: string = hnm_bin()
+    if bin == "" is return shx::fail(unavailable_msg()) end
+    shx::emit_log("info", "Rolling back to Nix generation " + to_string(generation) + " via hnm...")
+    shx::emit_prog("rollback", "Switching to generation " + to_string(generation) + "...", 0.2)
+    let r: shx::Res = shx::run_streaming([bin, "rollback", to_string(generation)])
+    if !r.ok is return r end
+    shx::emit_prog("done", "Rolled back.", 1.0)
+    return shx::ok("Rolled back to generation " + to_string(generation) + ".")
+end
+
+pub fn pin(package_in: string, version_in: string) -> shx::Res is
+    let pv: shx::Res = security::validate_pkg_token(package_in)
+    if !pv.ok is return pv end
+    let package: string = pv.val
+    let mut version: string = ""
+    if string_trim(version_in) != "" is
+        let vv: shx::Res = security::validate_pkg_token(string_trim(version_in))
+        if !vv.ok is return vv end
+        version = vv.val
+    end
+    let bin: string = hnm_bin()
+    if bin == "" is return shx::fail(unavailable_msg()) end
+    shx::emit_log("info", "Pinning " + package + " via hnm...")
+    shx::emit_prog("pin", "Pinning " + package + "...", 0.3)
+    let mut argv: [string] = [bin, "pin", package]
+    if version != "" is argv = array_push(argv, version) end
+    let r: shx::Res = shx::run_streaming(argv)
+    if !r.ok is return r end
+    shx::emit_prog("done", "Pinned.", 1.0)
+    return shx::ok("Pinned " + package + (if version != "" then " to " + version else "") + ".")
+end
+
+pub fn unpin(package_in: string) -> shx::Res is
+    let pv: shx::Res = security::validate_pkg_token(package_in)
+    if !pv.ok is return pv end
+    let package: string = pv.val
+    let bin: string = hnm_bin()
+    if bin == "" is return shx::fail(unavailable_msg()) end
+    shx::emit_log("info", "Unpinning " + package + " via hnm...")
+    shx::emit_prog("unpin", "Unpinning " + package + "...", 0.3)
+    let r: shx::Res = shx::run_streaming([bin, "unpin", package])
+    if !r.ok is return r end
+    shx::emit_prog("done", "Unpinned.", 1.0)
+    return shx::ok("Unpinned " + package + " — it will be updated by `hnm update` again.")
+end
+
+fn simple_action(arg: [string], log: string, step: string, msg: string, pct: f64, done_msg: string, ret: string) -> shx::Res is
+    let bin: string = hnm_bin()
+    if bin == "" is return shx::fail(unavailable_msg()) end
+    shx::emit_log("info", log)
+    shx::emit_prog(step, msg, pct)
+    let r: shx::Res = shx::run_streaming(array_concat([bin], arg))
+    if !r.ok is return r end
+    shx::emit_prog("done", done_msg, 1.0)
+    return shx::ok(ret)
+end
+
+pub fn gc() -> shx::Res is
+    return simple_action(["gc"], "Running Nix garbage collection via hnm (`nix-store --gc`)...", "gc", "Collecting garbage...", 0.2, "Garbage collection complete.", "Nix garbage collection complete — check the log for how much store space was freed.")
+end
+
+pub fn clean() -> shx::Res is
+    return simple_action(["clean"], "Cleaning hnm's download/eval cache...", "clean", "Cleaning cache...", 0.3, "Cache cleaned.", "hnm cache cleaned. Run Garbage Collection too if you want to reclaim /nix/store space.")
+end
+
+pub fn update_index() -> shx::Res is
+    return simple_action(["update"], "Refreshing the nixpkgs channel and rebuilding the local Nix package index (`hnm update`). This can take 1-2 minutes on the first run...", "index", "Refreshing nixpkgs channel and package index...", 0.1, "Nix package index is up to date.", "Nix package index refreshed — Discover's nix search will now find nixpkgs packages.")
+end
+
+pub fn env_activate() -> shx::Res is
+    return simple_action(["env", "activate", "--yes"], "Activating hnm shell integration (patching ~/.bashrc, ~/.zshrc, ~/.profile)...", "env", "Patching shell profile files...", 0.3, "Shell integration activated.", "hnm shell integration activated — open a new terminal (or reload your shell) to use installed nix packages there.")
+end
+
+pub fn env_deactivate() -> shx::Res is
+    return simple_action(["env", "deactivate", "--yes"], "Deactivating hnm shell integration...", "env", "Removing shell profile patch...", 0.3, "Shell integration deactivated.", "hnm shell integration deactivated.")
+end
+
+pub fn env_status() -> shx::Res is
+    let bin: string = hnm_bin()
+    if bin == "" is return shx::fail(unavailable_msg()) end
+    let o: shx::Out = shx::run_timeout([bin, "env", "status"], 8)
+    if o.timed_out || !o.spawned is return shx::fail("hnm env status did not respond within 8s.") end
+    return shx::ok(string_trim(o.stdout))
+end
+
+fn capture_report(bin: string, args: [string], secs: int, tmsg: string) -> shx::Res is
+    let o: shx::Out = shx::run_timeout(array_concat([bin], args), secs)
+    if o.timed_out || !o.spawned is return shx::fail(tmsg) end
+    let mut text: string = string_trim(o.stdout)
+    let err: string = string_trim(o.stderr)
+    if err != "" is
+        if text != "" is text = text + "\n\n" end
+        text = text + err
+    end
+    return shx::ok(text)
+end
+
+pub fn doctor() -> shx::Res is
+    let bin: string = hnm_bin()
+    if bin == "" is return shx::fail(unavailable_msg()) end
+    return capture_report(bin, ["doctor"], 20, "hnm doctor did not respond within 20s.")
+end
+
+pub fn check() -> shx::Res is
+    let bin: string = hnm_bin()
+    if bin == "" is return shx::fail(unavailable_msg()) end
+    return capture_report(bin, ["check"], 10, "hnm check did not respond within 10s.")
+end
+
+;; "" = None
+pub fn which(package_in: string) -> string is
+    let pv: shx::Res = security::validate_pkg_token(package_in)
+    if !pv.ok is return "" end
+    let bin: string = hnm_bin()
+    if bin == "" is return "" end
+    let o: shx::Out = shx::run_timeout([bin, "which", pv.val], 6)
+    if !o.spawned || o.timed_out || o.code != 0 is return "" end
+    return string_trim(o.stdout)
+end
+
+pub fn install(spec_in: string) -> shx::Res is
+    let pv: shx::Res = security::validate_pkg_token(spec_in)
+    if !pv.ok is return pv end
+    let spec: string = pv.val
+    let bin: string = hnm_bin()
+    if bin == "" is return shx::fail(unavailable_msg()) end
+    shx::emit_log("info", "Installing " + spec + " via hnm (Nix/nixpkgs)...")
+    shx::emit_prog("install", "Installing " + spec + "...", 0.2)
+    let r: shx::Res = shx::run_streaming([bin, "install", spec, "--no-env"])
+    if !r.ok is return r end
+    shx::emit_prog("done", "Done!", 1.0)
+    return shx::ok_unit()
+end
+
+pub fn remove(spec_in: string) -> shx::Res is
+    let pv: shx::Res = security::validate_pkg_token(spec_in)
+    if !pv.ok is return pv end
+    let spec: string = pv.val
+    let bin: string = hnm_bin()
+    if bin == "" is return shx::fail(unavailable_msg()) end
+    shx::emit_log("info", "Removing " + spec + " via hnm...")
+    shx::emit_prog("uninstall", "Removing " + spec + "...", 0.3)
+    let r: shx::Res = shx::run_streaming([bin, "remove", spec, "--force"])
+    if !r.ok is return r end
+    shx::emit_prog("done", "Removed.", 1.0)
+    return shx::ok_unit()
+end
+
+;; ───────── polecenia Tauri ─────────
+pub fn cmd_nix_list_generations(args: string) -> shx::Res is
+    return list_generations()
+end
+
+pub fn cmd_nix_store_size(args: string) -> shx::Res is
+    return shx::ok(jx::quote(store_size()))
+end
+
+pub fn cmd_nix_list_installed(args: string) -> shx::Res is
+    return shx::ok(list_installed())
+end
+
+pub fn cmd_nix_env_status(args: string) -> shx::Res is
+    let r: shx::Res = env_status()
+    if !r.ok is return r end
+    return shx::ok(jx::quote(r.val))
+end
+
+pub fn cmd_nix_doctor(args: string) -> shx::Res is
+    let r: shx::Res = doctor()
+    if !r.ok is return r end
+    return shx::ok(jx::quote(r.val))
+end
+
+pub fn cmd_nix_check(args: string) -> shx::Res is
+    let r: shx::Res = check()
+    if !r.ok is return r end
+    return shx::ok(jx::quote(r.val))
+end
+
+pub fn cmd_nix_which(args: string) -> shx::Res is
+    let w: string = which(jx::get_str(args, "package"))
+    return shx::ok(if w == "" then "null" else jx::quote(w))
+end
+
+fn strres(r: shx::Res) -> shx::Res is
+    if !r.ok is return r end
+    return shx::ok(jx::quote(r.val))
+end
+
+pub fn cmd_nix_rollback(args: string) -> shx::Res is
+    return strres(rollback(jx::get_int(args, "generation")))
+end
+
+pub fn cmd_nix_pin(args: string) -> shx::Res is
+    return strres(pin(jx::get_str(args, "package"), jx::get_str(args, "version")))
+end
+
+pub fn cmd_nix_unpin(args: string) -> shx::Res is
+    return strres(unpin(jx::get_str(args, "package")))
+end
+
+pub fn cmd_nix_gc(args: string) -> shx::Res is
+    return strres(gc())
+end
+
+pub fn cmd_nix_clean(args: string) -> shx::Res is
+    return strres(clean())
+end
+
+pub fn cmd_nix_update_index(args: string) -> shx::Res is
+    let r: shx::Res = update_index()
+    if r.ok is cache::drop_source("nix") end
+    return strres(r)
+end
+
+pub fn cmd_nix_env_activate(args: string) -> shx::Res is
+    return strres(env_activate())
+end
+
+pub fn cmd_nix_env_deactivate(args: string) -> shx::Res is
+    return strres(env_deactivate())
+end
