@@ -1,0 +1,1122 @@
+use "std -> fs"  from "fs"
+use "std -> env" from "env"
+use "std -> process" from "proc"
+mod jx
+mod shx
+mod kv
+mod security
+mod settings
+mod cache
+mod jwalk
+mod pkgbackend
+mod hpm
+mod hnm
+mod appimage
+mod history
+mod ratings
+mod curated
+
+const TTL: int = 120
+
+fn mk_issue(source: string, kind: string, message: string) -> string is
+    let o = jx::ob()
+    jx::p_str(o, "source", source)
+    jx::p_str(o, "kind", kind)
+    jx::p_str(o, "message", message)
+    return jx::ob_end(o)
+end
+
+fn issue_res(source: string, kind: string, message: string) -> shx::Res is
+    return shx::fail(mk_issue(source, kind, message))
+end
+
+;; Res: ok => stdout; !ok => err = JSON SourceIssue (odpowiednik run_timeout_reported)
+fn reported(argv: [string], secs: int, source: string) -> shx::Res is
+    let o: shx::Out = shx::run_timeout(argv, secs)
+    if o.timed_out is
+        return issue_res(source, "timeout", source + " did not respond within " + to_string(secs) + "s.")
+    end
+    if !o.spawned is
+        return issue_res(source, "unavailable", source + " is not installed on this system.")
+    end
+    return shx::ok(o.stdout)
+end
+
+fn dres(name: string, version: string, desc: string, source: string, pid: string) -> string is
+    let o = jx::ob()
+    jx::p_str(o, "name", name)
+    jx::p_str(o, "version", version)
+    jx::p_str(o, "desc", desc)
+    jx::p_str(o, "source", source)
+    jx::p_str(o, "package_id", pid)
+    jx::p_null(o, "size")
+    jx::p_null(o, "icon")
+    return jx::ob_end(o)
+end
+
+fn ws_split(s: string) -> [string] is
+    let mut out: [string] = []
+    let n: int = string_len(s)
+    let mut i: int = 0
+    let mut start: int = -1
+    while i < n is
+        let b: int = byte_at(s, i)
+        let sp: bool = b == 32 || b == 9 || b == 13
+        if sp is
+            if start >= 0 is
+                out = array_push(out, string_slice(s, start, i))
+                start = -1
+            end
+        else is
+            if start < 0 is start = i end
+        end
+        i += 1
+    end
+    if start >= 0 is out = array_push(out, string_slice(s, start, n)) end
+    return out
+end
+
+;; ───────── źródła ─────────
+fn search_flatpak(query: string) -> shx::Res is
+    let r: shx::Res = reported(["flatpak", "search", "--columns=name,description,application,version", query], 5, "flatpak")
+    if !r.ok is return r end
+    let lines: [string] = shx::lines_of(r.val)
+    let mut out: [string] = []
+    let mut taken: int = 0
+    let mut i: int = 0
+    while i < array_len(lines) && taken < 10 is
+        let l: string = lines[i]
+        i += 1
+        if string_starts_with(l, "Name") is continue end
+        taken += 1
+        let c: [string] = str_split(l, "\t")
+        if array_len(c) < 3 is continue end
+        let name: string = string_trim(c[0])
+        if name == "" is continue end
+        let ver: string = if array_len(c) > 3 then string_trim(c[3]) else ""
+        out = array_push(out, dres(name, ver, string_trim(c[1]), "flatpak", string_trim(c[2])))
+    end
+    return shx::ok(jx::arr_raw(out))
+end
+
+fn search_snap(query: string) -> shx::Res is
+    let r: shx::Res = reported(["snap", "find", query], 6, "snap")
+    if !r.ok is return r end
+    let lines: [string] = shx::lines_of(r.val)
+    let mut out: [string] = []
+    let mut i: int = 1
+    while i < array_len(lines) && i < 9 is
+        let c: [string] = ws_split(lines[i])
+        i += 1
+        if array_len(c) == 0 is continue end
+        let ver: string = if array_len(c) > 1 then c[1] else ""
+        let mut desc: string = ""
+        let mut j: int = 3
+        while j < array_len(c) is
+            desc = if desc == "" then c[j] else desc + " " + c[j]
+            j += 1
+        end
+        out = array_push(out, dres(c[0], ver, desc, "snap", c[0]))
+    end
+    return shx::ok(jx::arr_raw(out))
+end
+
+fn search_brew(query: string) -> shx::Res is
+    let r: shx::Res = reported(["brew", "search", query], 6, "brew")
+    if !r.ok is return r end
+    let lines: [string] = shx::lines_of(r.val)
+    let mut out: [string] = []
+    let mut in_sec: bool = false
+    let mut i: int = 0
+    while i < array_len(lines) && i < 40 is
+        let l: string = lines[i]
+        i += 1
+        if string_starts_with(l, "=") is
+            in_sec = true
+            continue
+        end
+        if !in_sec is continue end
+        let name: string = string_trim(l)
+        if name == "" is continue end
+        out = array_push(out, dres(name, "", "", "brew", name))
+        if array_len(out) >= 8 is break end
+    end
+    return shx::ok(jx::arr_raw(out))
+end
+
+pub fn fetch_source(source: string, query: string) -> shx::Res is
+    if source == "apt" is return pkgbackend::search(query) end
+    if source == "flatpak" is return search_flatpak(query) end
+    if source == "snap" is return search_snap(query) end
+    if source == "brew" is return search_brew(query) end
+    if source == "hpm" is return hpm::search(query) end
+    if source == "nix" is return hnm::search(query) end
+    if source == "appimage" is return appimage::search(query) end
+    return shx::ok("[]")
+end
+
+;; tryb `--src SOURCE QUERY`: JSON {"ok":true,"val":[..]} / {"ok":false,"err":"<issue json>"}
+pub fn src_json(source: string, query: string) -> string is
+    let r: shx::Res = fetch_source(source, query)
+    let o = jx::ob()
+    jx::p_bool(o, "ok", r.ok)
+    if r.ok is jx::p_raw(o, "val", if string_trim(r.val) == "" then "[]" else r.val) end
+    if !r.ok is jx::p_str(o, "err", r.err) end
+    return jx::ob_end(o)
+end
+
+fn self_exe() -> string is
+    let r: string = string_trim(proc::run("readlink -f /proc/" + to_string(getpid()) + "/exe"))
+    return if r == "" then env::args()[0] else r
+end
+
+pub struct Batch is
+    pub results: [string]
+    pub issues:  [string]
+end
+
+fn all_sources() -> [string] is
+    return ["apt", "flatpak", "snap", "brew", "hpm", "nix", "appimage"]
+end
+
+fn contains(xs: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(xs) is
+        if xs[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Dla każdego zapytania zwraca Batch (wyniki + problemy), źródła odpytywane równolegle, wyniki cache'owane per źródło.
+fn run_all_sources(queries: [string], enabled: [string]) -> [Batch] is
+    let srcs: [string] = all_sources()
+    let mut keys: [string] = []
+    let mut cached: [string] = []
+    let mut scripts: [string] = []
+    let mut task_of: [int] = []
+    let mut t: int = 0
+    let exe: string = self_exe()
+    let inline: bool = env::get("HOS_INLINE") == "1"
+    let mut qi: int = 0
+    while qi < array_len(queries) is
+        let q: string = queries[qi]
+        let qlc: string = string_lower(q)
+        let mut si: int = 0
+        while si < array_len(srcs) is
+            let s: string = srcs[si]
+            si += 1
+            if !contains(enabled, s) is
+                keys = array_push(keys, "")
+                cached = array_push(cached, "")
+                task_of = array_push(task_of, -1)
+                continue
+            end
+            let key: string = s + ":" + qlc
+            keys = array_push(keys, key)
+            let c: string = cache::get(key, TTL)
+            cached = array_push(cached, c)
+            if c == "" is
+                task_of = array_push(task_of, t)
+                t += 1
+                scripts = array_push(scripts, shx::q(exe) + " --src " + shx::q(s) + " " + shx::q(q))
+            else is
+                task_of = array_push(task_of, -1)
+            end
+        end
+        qi += 1
+    end
+    let mut outs: [string] = []
+    if t > 0 is
+        if inline is
+            let mut k: int = 0
+            qi = 0
+            while qi < array_len(queries) is
+                let mut si2: int = 0
+                while si2 < array_len(srcs) is
+                    let idx: int = qi * array_len(srcs) + si2
+                    si2 += 1
+                    if task_of[idx] >= 0 is outs = array_push(outs, src_json(srcs[si2 - 1], queries[qi])) end
+                end
+                qi += 1
+            end
+        else is
+            outs = shx::par(scripts, 17).outs
+        end
+    end
+    let mut batches: [Batch] = []
+    qi = 0
+    while qi < array_len(queries) is
+        let mut res: [string] = []
+        let mut iss: [string] = []
+        let mut si3: int = 0
+        while si3 < array_len(srcs) is
+            let idx2: int = qi * array_len(srcs) + si3
+            let s2: string = srcs[si3]
+            si3 += 1
+            if keys[idx2] == "" is continue end
+            let mut outcome: string = cached[idx2]
+            if outcome == "" is
+                let o: string = string_trim(outs[task_of[idx2]])
+                if o == "" || !string_starts_with(o, "{") is
+                    iss = array_push(iss, mk_issue(s2, "timeout", s2 + " did not respond in time."))
+                    continue
+                end
+                outcome = o
+                cache::set(keys[idx2], o)
+            end
+            if jx::get_bool(outcome, "ok") is
+                res = array_concat(res, jx::array_items(jx::get_raw(outcome, "val")))
+            else is
+                let e: string = jx::get_str(outcome, "err")
+                if e != "" is iss = array_push(iss, e) end
+            end
+        end
+        batches = array_push(batches, Batch { results: res, issues: iss })
+        qi += 1
+    end
+    return batches
+end
+
+;; ───────── ikony ─────────
+fn safe_id(s: string) -> bool is
+    return s != "" && !string_contains(s, "/") && !string_contains(s, "..")
+end
+
+fn flatpak_icon_script(id: string) -> string is
+    return "ID=" + shx::q(id) + "; for b in \"$HOME/.local/share/flatpak/appstream/flathub\" /var/lib/flatpak/appstream/flathub; do for a in x86_64 aarch64; do for s in 128x128 64x64; do f=\"$b/$a/active/icons/$s/$ID.png\"; if [ -s \"$f\" ]; then base64 -w0 \"$f\"; exit 0; fi; done; done; done"
+end
+
+fn apt_icon_script(id: string) -> string is
+    return "ID=" + shx::q(id) + "; for f in /var/cache/app-info/icons/*/128x128/$ID.png /var/cache/app-info/icons/*/64x64/$ID.png; do if [ -s \"$f\" ]; then base64 -w0 \"$f\"; exit 0; fi; done"
+end
+
+fn png_url(b64: string) -> string is
+    return if b64 == "" then "" else "data:image/png;base64," + b64
+end
+
+pub fn single_flatpak_icon(id: string) -> string is
+    if !safe_id(id) is return "" end
+    return png_url(string_trim(shx::run_sh(flatpak_icon_script(id), 5).stdout))
+end
+
+pub fn single_apt_icon(id: string) -> string is
+    if !safe_id(id) is return "" end
+    return png_url(string_trim(shx::run_sh(apt_icon_script(id), 5).stdout))
+end
+
+fn snap_json_script(name: string) -> string is
+    return "curl -fsS --max-time 4 -H 'Snap-Device-Series: 16' " + shx::q("https://api.snapcraft.io/v2/snaps/info/" + name)
+end
+
+fn icon_url_from_snap_json(raw: string) -> string is
+    let media: [string] = jx::array_items(jx::get_raw(jx::get_raw(raw, "snap"), "media"))
+    let mut i: int = 0
+    while i < array_len(media) is
+        if jx::get_str(media[i], "type") == "icon" is return jx::get_str(media[i], "url") end
+        i += 1
+    end
+    return ""
+end
+
+fn snap_icon_fetch_script(url: string) -> string is
+    return "curl -fsSL --max-time 4 " + shx::q(url) + " | head -c 1500001 | base64 -w0"
+end
+
+fn mime_for(url: string) -> string is
+    return if string_ends_with(url, ".svg") then "image/svg+xml" else "image/png"
+end
+
+pub fn snapcraft_icon(name: string) -> string is
+    if name == "" is return "" end
+    let o: shx::Out = shx::run_sh(snap_json_script(name), 5)
+    if o.code != 0 is return "" end
+    let u: string = icon_url_from_snap_json(o.stdout)
+    if u == "" is return "" end
+    let b: string = string_trim(shx::run_sh(snap_icon_fetch_script(u), 6).stdout)
+    if b == "" || string_len(b) > 2000000 is return "" end
+    return "data:" + mime_for(u) + ";base64," + b
+end
+
+;; dedup (source::name lowercase), max 24, dołącz ikony równolegle
+fn dedupe_and_enrich(items: [string]) -> [string] is
+    let mut seen: [string] = []
+    let mut dd: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) && array_len(dd) < 24 is
+        let key: string = jx::get_str(items[i], "source") + "::" + string_lower(jx::get_str(items[i], "name"))
+        if !contains(seen, key) is
+            seen = array_push(seen, key)
+            dd = array_push(dd, items[i])
+        end
+        i += 1
+    end
+    ;; etap 1: lokalne ikony + JSON snapcrafta (równolegle)
+    let mut scripts: [string] = []
+    let mut idx: [int] = []
+    i = 0
+    while i < array_len(dd) is
+        let src: string = jx::get_str(dd[i], "source")
+        let pid: string = jx::get_str(dd[i], "package_id")
+        if src == "flatpak" && safe_id(pid) is
+            scripts = array_push(scripts, flatpak_icon_script(pid))
+            idx = array_push(idx, i)
+        end
+        if src == "apt" && safe_id(pid) is
+            scripts = array_push(scripts, apt_icon_script(pid))
+            idx = array_push(idx, i)
+        end
+        if src == "snap" && pid != "" is
+            scripts = array_push(scripts, snap_json_script(pid))
+            idx = array_push(idx, i)
+        end
+        i += 1
+    end
+    if array_len(scripts) == 0 is return dd end
+    let p1: shx::ParOut = shx::par(scripts, 6)
+    let mut icons: [string] = []
+    i = 0
+    while i < array_len(dd) is
+        icons = array_push(icons, "")
+        i += 1
+    end
+    let mut s2: [string] = []
+    let mut idx2: [int] = []
+    let mut urls: [string] = []
+    let mut k: int = 0
+    while k < array_len(idx) is
+        let di: int = idx[k]
+        let src2: string = jx::get_str(dd[di], "source")
+        let o: string = string_trim(p1.outs[k])
+        if src2 == "snap" is
+            let u: string = if p1.codes[k] == 0 then icon_url_from_snap_json(o) else ""
+            if u != "" is
+                s2 = array_push(s2, snap_icon_fetch_script(u))
+                idx2 = array_push(idx2, di)
+                urls = array_push(urls, u)
+            end
+        else is
+            icons[di] = png_url(o)
+        end
+        k += 1
+    end
+    if array_len(s2) > 0 is
+        let p2: shx::ParOut = shx::par(s2, 6)
+        let mut m: int = 0
+        while m < array_len(s2) is
+            let b: string = string_trim(p2.outs[m])
+            if b != "" && string_len(b) <= 2000000 is
+                icons[idx2[m]] = "data:" + mime_for(urls[m]) + ";base64," + b
+            end
+            m += 1
+        end
+    end
+    let mut out: [string] = []
+    i = 0
+    while i < array_len(dd) is
+        out = array_push(out, if icons[i] == "" then dd[i] else jx::set_str(dd[i], "icon", icons[i]))
+        i += 1
+    end
+    return out
+end
+
+;; ───────── kategorie ─────────
+fn cat_ids() -> [string] is
+    return ["development", "office", "graphics", "media", "internet", "security", "system", "games", "utilities"]
+end
+fn cat_labels() -> [string] is
+    return ["Development", "Office & Productivity", "Graphics & Photography", "Audio & Video", "Internet & Communication", "Security & Privacy", "System Tools", "Games", "Utilities"]
+end
+fn cat_icons() -> [string] is
+    return ["Code", "FileText", "Palette", "Music", "Globe", "Shield", "Cpu", "Gamepad2", "Wrench"]
+end
+fn cat_kws(id: string) -> [string] is
+    if id == "development" is return ["ide", "compiler git"] end
+    if id == "office" is return ["office suite", "pdf reader"] end
+    if id == "graphics" is return ["image editor", "photo editor"] end
+    if id == "media" is return ["video editor", "audio editor"] end
+    if id == "internet" is return ["web browser", "email client"] end
+    if id == "security" is return ["password manager", "vpn client"] end
+    if id == "system" is return ["backup tool", "disk utility"] end
+    if id == "games" is return ["game"] end
+    if id == "utilities" is return ["file manager", "archive manager"] end
+    return []
+end
+
+pub fn cmd_discover_categories(args: string) -> shx::Res is
+    let ids: [string] = cat_ids()
+    let lb: [string] = cat_labels()
+    let ic: [string] = cat_icons()
+    let mut items: [string] = []
+    let mut i: int = 0
+    while i < array_len(ids) is
+        let o = jx::ob()
+        jx::p_str(o, "id", ids[i])
+        jx::p_str(o, "label", lb[i])
+        jx::p_str(o, "icon", ic[i])
+        items = array_push(items, jx::ob_end(o))
+        i += 1
+    end
+    return shx::ok(jx::arr_raw(items))
+end
+
+fn response(results: [string], issues: [string]) -> string is
+    let o = jx::ob()
+    jx::p_raw(o, "results", jx::arr_raw(results))
+    jx::p_raw(o, "issues", jx::arr_raw(issues))
+    return jx::ob_end(o)
+end
+
+pub fn cmd_discover_browse(args: string) -> shx::Res is
+    let cat: string = jx::get_str(args, "categoryId")
+    let st: settings::Settings = settings::current()
+    let key: string = "browse:" + cat + ":" + iter_join(st.enabled_sources, ",")
+    let c: string = cache::get(key, TTL)
+    if c != "" is return shx::ok(c) end
+    let kws: [string] = cat_kws(cat)
+    let mut all: [string] = []
+    let mut issues: [string] = []
+    if array_len(kws) > 0 is
+        let bs: [Batch] = run_all_sources(kws, st.enabled_sources)
+        let mut b: int = 0
+        while b < array_len(bs) is
+            all = array_concat(all, bs[b].results)
+            let mut j: int = 0
+            while j < array_len(bs[b].issues) is
+                let src: string = jx::get_str(bs[b].issues[j], "source")
+                let mut dup: bool = false
+                let mut q: int = 0
+                while q < array_len(issues) is
+                    if jx::get_str(issues[q], "source") == src is dup = true end
+                    q += 1
+                end
+                if !dup is issues = array_push(issues, bs[b].issues[j]) end
+                j += 1
+            end
+            b += 1
+        end
+    end
+    let out: string = response(dedupe_and_enrich(all), issues)
+    cache::set(key, out)
+    return shx::ok(out)
+end
+
+pub fn cmd_discover_search(args: string) -> shx::Res is
+    let query: string = jx::get_str(args, "query")
+    let st: settings::Settings = settings::current()
+    let key: string = "search:" + string_lower(query) + ":" + iter_join(st.enabled_sources, ",")
+    let c: string = cache::get(key, TTL)
+    if c != "" is return shx::ok(c) end
+    let bs: [Batch] = run_all_sources([query], st.enabled_sources)
+    let out: string = response(dedupe_and_enrich(bs[0].results), bs[0].issues)
+    cache::set(key, out)
+    return shx::ok(out)
+end
+
+;; ───────── install / uninstall ─────────
+fn snap_install(id_in: string, channel: string) -> shx::Res is
+    let v: shx::Res = security::validate_pkg_token(id_in)
+    if !v.ok is return v end
+    let id: string = v.val
+    let info: shx::Out = shx::run_timeout(["snap", "info", id], 5)
+    let mut conf: string = ""
+    if info.spawned && !info.timed_out is
+        let ls: [string] = shx::lines_of(info.stdout)
+        let mut i: int = 0
+        while i < array_len(ls) is
+            if string_starts_with(ls[i], "confinement:") is
+                conf = string_trim(string_slice(ls[i], 12, string_len(ls[i])))
+                break
+            end
+            i += 1
+        end
+    end
+    let mut args: [string] = ["install", id]
+    if conf == "classic" is
+        shx::emit_log("info", id + " requires classic confinement — installing with --classic.")
+        args = array_push(args, "--classic")
+    end
+    if conf == "devmode" is
+        shx::emit_log("info", id + " is only published in devmode (development snap).")
+        args = array_push(args, "--devmode")
+    end
+    let chan: string = if channel != "" then channel else settings::current().snap_default_channel
+    if chan != "" && string_lower(chan) != "stable" is
+        let cv: shx::Res = security::validate_pkg_token(chan)
+        if !cv.ok is return cv end
+        shx::emit_log("info", "Installing " + id + " from channel " + cv.val + "...")
+        args = array_push(args, "--channel=" + cv.val)
+    end
+    return shx::priv_run(array_concat(["snap"], args))
+end
+
+fn last_segment(s: string) -> string is
+    let i: int = string_rfind(s, "/")
+    return if i < 0 then s else string_slice(s, i + 1, string_len(s))
+end
+
+fn emsg(r: shx::Res) -> string is
+    return if r.ok then "" else r.err
+end
+
+pub fn cmd_discover_install(args: string) -> shx::Res is
+    let pv: shx::Res = security::validate_pkg_token(jx::get_str(args, "packageId"))
+    if !pv.ok is return pv end
+    let pid: string = pv.val
+    let source: string = jx::get_str(args, "source")
+    let nm: string = jx::get_str(args, "name")
+    let display: string = if nm != "" then nm else last_segment(pid)
+    shx::emit_log("info", "Installing " + pid + " via " + source + "...")
+    shx::emit_prog("install", "Installing " + pid + "...", 0.2)
+    let mut result: shx::Res = shx::fail("Unknown source: " + source)
+    if source == "apt" is result = curated::apt_install([pid]) end
+    if source == "flatpak" is
+        result = curated::ensure_flatpak()
+        if result.ok is
+            let st: settings::Settings = settings::current()
+            let r0: string = jx::get_str(args, "remote")
+            let rn: shx::Res = security::validate_pkg_token(if r0 != "" then r0 else st.flatpak_default_remote)
+            if !rn.ok is
+                result = rn
+            else is
+                let b0: string = jx::get_str(args, "branch")
+                let ref_arg: string = curated::flatpak_ref(pid, if b0 != "" then b0 else st.flatpak_default_branch)
+                let t1: shx::Res = shx::run_streaming(["flatpak", "install", "-y", "--user", rn.val, ref_arg])
+                result = if t1.ok then t1 else shx::priv_run(["flatpak", "install", "-y", rn.val, ref_arg])
+            end
+        end
+    end
+    if source == "snap" is result = snap_install(pid, jx::get_str(args, "channel")) end
+    if source == "brew" is result = shx::run_streaming(["brew", "install", pid]) end
+    if source == "hpm" is result = hpm::install(pid) end
+    if source == "nix" is result = hnm::install(pid) end
+    if source == "appimage" is result = appimage::install(pid, display) end
+    let mut version: string = ""
+    let mut commit: string = ""
+    let mut gen: int = -1
+    if result.ok is
+        if source == "apt" is version = history::current_apt_version(pid) end
+        if source == "appimage" is version = jx::get_str(appimage::is_installed(pid), "version") end
+        if source == "flatpak" is commit = curated::flatpak_current_commit(pid) end
+        if source == "nix" is gen = hnm::current_generation() end
+    end
+    if commit != "" is
+        history::record_with_commit("install", source, display, pid, version, commit, result.ok, emsg(result))
+    else is
+        if gen >= 0 is
+            history::record_with_generation("install", source, display, pid, version, gen, result.ok, emsg(result))
+        else is
+            history::record("install", source, display, pid, version, result.ok, emsg(result))
+        end
+    end
+    if !result.ok is return result end
+    shx::emit_prog("done", "Done!", 1.0)
+    shx::emit_log("success", pid + " installed.")
+    return shx::ok(jx::quote(pid + " installed."))
+end
+
+pub fn cmd_discover_uninstall(args: string) -> shx::Res is
+    let pv: shx::Res = security::validate_pkg_token(jx::get_str(args, "packageId"))
+    if !pv.ok is return pv end
+    let pid: string = pv.val
+    let source: string = jx::get_str(args, "source")
+    shx::emit_log("info", "Removing " + pid + " (" + source + ")...")
+    shx::emit_prog("uninstall", "Removing " + pid + "...", 0.2)
+    let mut result: shx::Res = shx::fail("Unknown source: " + source)
+    if source == "apt" is result = curated::apt_remove([pid]) end
+    if source == "flatpak" is
+        let t1: shx::Res = shx::run_streaming(["flatpak", "uninstall", "-y", "--user", pid])
+        result = if t1.ok then t1 else shx::priv_run(["flatpak", "uninstall", "-y", pid])
+    end
+    if source == "snap" is result = shx::priv_run(["snap", "remove", pid]) end
+    if source == "brew" is result = shx::run_streaming(["brew", "uninstall", pid]) end
+    if source == "hpm" is result = hpm::remove(pid) end
+    if source == "nix" is result = hnm::remove(pid) end
+    if source == "appimage" is result = appimage::uninstall(pid) end
+    let gen: int = if result.ok && source == "nix" then hnm::current_generation() else -1
+    if gen >= 0 is
+        history::record_with_generation("uninstall", source, pid, pid, "", gen, result.ok, emsg(result))
+    else is
+        history::record("uninstall", source, pid, pid, "", result.ok, emsg(result))
+    end
+    if !result.ok is return result end
+    shx::emit_prog("done", "Removed.", 1.0)
+    shx::emit_log("success", pid + " removed.")
+    return shx::ok(jx::quote(pid + " removed."))
+end
+
+;; ───────── zainstalowane ─────────
+fn first_cols(text: string, skip: int) -> [string] is
+    let ls: [string] = shx::lines_of(text)
+    let mut out: [string] = []
+    let mut i: int = skip
+    while i < array_len(ls) is
+        let c: [string] = ws_split(ls[i])
+        i += 1
+        if array_len(c) > 0 is out = array_push(out, c[0]) end
+    end
+    return out
+end
+
+pub fn cmd_get_installed_sets(args: string) -> shx::Res is
+    let p: shx::ParOut = shx::par(["flatpak list --columns=application", "snap list", "brew list --formula"], 4)
+    let o = jx::ob()
+    jx::p_strs(o, "apt", pkgbackend::installed_names())
+    jx::p_strs(o, "flatpak", first_cols(p.outs[0], 0))
+    jx::p_strs(o, "snap", first_cols(p.outs[1], 1))
+    jx::p_strs(o, "brew", first_cols(p.outs[2], 0))
+    jx::p_strs(o, "hpm", hpm::installed_names())
+    jx::p_strs(o, "nix", hnm::installed_names())
+    let items: [string] = jx::array_items(appimage::list_installed())
+    let mut repos: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        repos = array_push(repos, jx::get_str(items[i], "repo"))
+        i += 1
+    end
+    jx::p_strs(o, "appimage", repos)
+    return shx::ok(jx::ob_end(o))
+end
+
+;; ───────── AppStream / szczegóły ─────────
+fn ensure_appstream() -> shx::Res is
+    if shx::has("appstreamcli") is return shx::ok_unit() end
+    shx::emit_log("info", "Installing AppStream metadata tools...")
+    return curated::apt_install(["appstream"])
+end
+
+;; "" gdy brak
+fn appstream_get(id: string) -> string is
+    let o: shx::Out = shx::run_timeout(["appstreamcli", "get", id, "--format=json"], 5)
+    if !o.spawned || o.timed_out || o.code != 0 || string_trim(o.stdout) == "" is return "" end
+    return string_trim(o.stdout)
+end
+
+fn locale_val(raw: string) -> string is
+    let t: string = string_trim(raw)
+    if jwalk::is_strv(t) is return jx::raw_to_str(t) end
+    if jwalk::is_obj(t) is
+        let c: string = jx::get_raw(t, "C")
+        if jwalk::is_strv(c) is return jx::raw_to_str(c) end
+        let ks: [string] = jx::keys(t)
+        let mut i: int = 0
+        while i < array_len(ks) is
+            let v: string = jx::get_raw(t, ks[i])
+            if jwalk::is_strv(v) is return jx::raw_to_str(v) end
+            i += 1
+        end
+    end
+    return ""
+end
+
+fn find_locale(obj: string, sub: string) -> string is
+    if !jwalk::is_obj(obj) is return "" end
+    let ks: [string] = jx::keys(obj)
+    let mut i: int = 0
+    while i < array_len(ks) is
+        if string_contains(string_lower(ks[i]), sub) is
+            let s: string = locale_val(jx::get_raw(obj, ks[i]))
+            if s != "" is return s end
+        end
+        i += 1
+    end
+    i = 0
+    while i < array_len(ks) is
+        let f: string = find_locale(jx::get_raw(obj, ks[i]), sub)
+        if f != "" is return f end
+        i += 1
+    end
+    return ""
+end
+
+fn plain_strings(raw: string, acc: [string]) -> [string] is
+    let mut out: [string] = acc
+    let t: string = string_trim(raw)
+    if jwalk::is_strv(t) is return array_push(out, jx::raw_to_str(t)) end
+    if jwalk::is_arr(t) is
+        let items: [string] = jx::array_items(t)
+        let mut i: int = 0
+        while i < array_len(items) is
+            out = plain_strings(items[i], out)
+            i += 1
+        end
+    end
+    return out
+end
+
+fn strings_under(obj: string, sub: string, acc: [string]) -> [string] is
+    let mut out: [string] = acc
+    if !jwalk::is_obj(obj) is return out end
+    let ks: [string] = jx::keys(obj)
+    let mut i: int = 0
+    while i < array_len(ks) is
+        let v: string = jx::get_raw(obj, ks[i])
+        if string_contains(string_lower(ks[i]), sub) is
+            out = plain_strings(v, out)
+        else is
+            out = strings_under(v, sub, out)
+        end
+        i += 1
+    end
+    return out
+end
+
+fn urls_under(raw: string, sub: string, acc: [string]) -> [string] is
+    let mut out: [string] = acc
+    if jwalk::is_obj(raw) is
+        let ks: [string] = jx::keys(raw)
+        let mut i: int = 0
+        while i < array_len(ks) is
+            let v: string = jx::get_raw(raw, ks[i])
+            if string_contains(string_lower(ks[i]), sub) is
+                let all: [string] = jwalk::collect_strings(v)
+                let mut j: int = 0
+                while j < array_len(all) is
+                    if string_starts_with(all[j], "http") is out = array_push(out, all[j]) end
+                    j += 1
+                end
+            else is
+                out = urls_under(v, sub, out)
+            end
+            i += 1
+        end
+    end
+    if jwalk::is_arr(raw) is
+        let items: [string] = jx::array_items(raw)
+        let mut k: int = 0
+        while k < array_len(items) is
+            out = urls_under(items[k], sub, out)
+            k += 1
+        end
+    end
+    return out
+end
+
+fn sort_dedup(xs: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(xs) is
+        let x: string = xs[i]
+        i += 1
+        if contains(out, x) is continue end
+        let mut pos: int = array_len(out)
+        let mut j: int = 0
+        while j < array_len(out) is
+            if x < out[j] is
+                pos = j
+                break
+            end
+            j += 1
+        end
+        let mut n: [string] = []
+        let mut k: int = 0
+        while k < array_len(out) is
+            if k == pos is n = array_push(n, x) end
+            n = array_push(n, out[k])
+            k += 1
+        end
+        if pos >= array_len(out) is n = array_push(n, x) end
+        out = n
+    end
+    return out
+end
+
+fn strip_simple_markup(s: string) -> string is
+    let mut text: string = ""
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n is
+        let lt: int = string_find(string_slice(s, i, n), "<")
+        if lt < 0 is
+            text = text + string_slice(s, i, n)
+            break
+        end
+        text = text + string_slice(s, i, i + lt)
+        let rest: string = string_slice(s, i + lt, n)
+        let gt: int = string_find(rest, ">")
+        if gt < 0 is break end
+        text = text + "\n"
+        i = i + lt + gt + 1
+    end
+    let ls: [string] = str_split(text, "\n")
+    let mut parts: [string] = []
+    let mut j: int = 0
+    while j < array_len(ls) is
+        let t: string = string_trim(ls[j])
+        if t != "" is parts = array_push(parts, t) end
+        j += 1
+    end
+    return iter_join(parts, "\n\n")
+end
+
+pub struct Det is
+    pub summary:     string
+    pub description: string
+    pub icon:        string
+    pub shots:       [string]
+    pub version:     string
+    pub license:     string
+    pub homepage:    string
+    pub cats:        [string]
+    pub size:        string
+    pub confinement: string
+end
+
+fn det_empty() -> Det is
+    return Det { summary: "", description: "", icon: "", shots: [], version: "", license: "", homepage: "", cats: [], size: "", confinement: "" }
+end
+
+fn enrich_appstream(d: Det, json: string) -> Det is
+    let mut r: Det = d
+    let root: string = if jwalk::is_arr(json) then (if array_len(jx::array_items(json)) > 0 then jx::array_items(json)[0] else "null") else json
+    let s: string = find_locale(root, "summary")
+    if s != "" is r.summary = s end
+    let de: string = find_locale(root, "description")
+    if de != "" is r.description = strip_simple_markup(de) end
+    let hp: string = jwalk::find_str(root, "homepage")
+    if hp != "" is r.homepage = hp end
+    let lic: string = jwalk::find_str(root, "project_license")
+    let lic2: string = if lic != "" then lic else jwalk::find_str(root, "license")
+    if lic2 != "" is r.license = lic2 end
+    let cats: [string] = sort_dedup(strings_under(root, "categor", []))
+    if array_len(cats) > 0 is r.cats = cats end
+    let raw_shots: [string] = urls_under(root, "screenshot", [])
+    let mut keep: [string] = []
+    let mut i: int = 0
+    while i < array_len(raw_shots) is
+        let u: string = raw_shots[i]
+        i += 1
+        if string_ends_with(u, ".png") || string_ends_with(u, ".jpg") || string_ends_with(u, ".jpeg") || string_contains(u, "screenshot") is
+            keep = array_push(keep, u)
+        end
+    end
+    let shots: [string] = sort_dedup(keep)
+    if array_len(shots) > 0 is
+        let mut top: [string] = []
+        let mut j: int = 0
+        while j < array_len(shots) && j < 6 is
+            top = array_push(top, shots[j])
+            j += 1
+        end
+        r.shots = top
+    end
+    return r
+end
+
+fn parse_snap_info(d: Det, text: string) -> Det is
+    let mut r: Det = d
+    let ls: [string] = shx::lines_of(text)
+    let mut in_desc: bool = false
+    let mut desc: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let line: string = ls[i]
+        i += 1
+        if string_starts_with(line, "summary:") is
+            r.summary = string_trim(string_slice(line, 8, string_len(line)))
+            continue
+        end
+        if string_starts_with(line, "license:") is
+            r.license = string_trim(string_slice(line, 8, string_len(line)))
+            continue
+        end
+        if string_starts_with(line, "publisher:") is
+            r.cats = array_push(r.cats, "Publisher: " + string_trim(string_slice(line, 10, string_len(line))))
+            continue
+        end
+        if string_starts_with(line, "confinement:") is
+            r.confinement = string_trim(string_slice(line, 12, string_len(line)))
+            continue
+        end
+        if string_starts_with(line, "description:") is
+            in_desc = true
+            continue
+        end
+        if in_desc is
+            if string_starts_with(line, " ") || string_starts_with(line, "|") is
+                let mut l2: string = line
+                while string_starts_with(l2, "|") is l2 = string_slice(l2, 1, string_len(l2)) end
+                desc = array_push(desc, string_trim(l2))
+            else is
+                in_desc = false
+            end
+        end
+        let tl: string = string_trim(line)
+        if string_starts_with(tl, "stable:") is
+            let parts: [string] = ws_split(string_slice(tl, 7, string_len(tl)))
+            if array_len(parts) > 0 is r.version = parts[0] end
+            let mut k: int = 0
+            while k < array_len(parts) is
+                if string_ends_with(parts[k], "MB") || string_ends_with(parts[k], "kB") || string_ends_with(parts[k], "GB") is
+                    r.size = parts[k]
+                    break
+                end
+                k += 1
+            end
+        end
+    end
+    if array_len(desc) > 0 is r.description = string_trim(iter_join(desc, " ")) end
+    return r
+end
+
+fn parse_brew_info(d: Det, text: string) -> Det is
+    let mut r: Det = d
+    let f: [string] = jx::array_items(jx::get_raw(text, "formulae"))
+    let c: [string] = jx::array_items(jx::get_raw(text, "casks"))
+    let item: string = if array_len(f) > 0 then f[0] else (if array_len(c) > 0 then c[0] else "")
+    if item == "" is return r end
+    let ds: string = jx::get_str(item, "desc")
+    if ds != "" is
+        r.summary = ds
+        r.description = ds
+    end
+    let hp: string = jx::get_str(item, "homepage")
+    if hp != "" is r.homepage = hp end
+    let lic: string = jx::get_str(item, "license")
+    if lic != "" is r.license = lic end
+    let sv: string = jx::get_str(jx::get_raw(item, "versions"), "stable")
+    if sv != "" is r.version = sv end
+    return r
+end
+
+;; JSON {"average","count"} albo "null"
+fn fetch_rating(app_id: string) -> string is
+    if app_id == "" is return "null" end
+    let o: shx::Out = shx::run_sh("curl -fsS --max-time 3 " + shx::q("https://odrs.gnome.org/api/v2/ratings/" + app_id), 4)
+    if o.code != 0 || !jwalk::is_obj(o.stdout) is return "null" end
+    let mut weighted: int = 0
+    let mut count: int = 0
+    let mut s: int = 1
+    while s <= 5 is
+        let n: int = jx::get_int(o.stdout, "star" + to_string(s))
+        weighted += s * n
+        count += n
+        s += 1
+    end
+    if count == 0 is return "null" end
+    let r = jx::ob()
+    jx::p_raw(r, "average", to_string((weighted + 0.0) / (count + 0.0)))
+    jx::p_int(r, "count", count)
+    return jx::ob_end(r)
+end
+
+fn file_icon_b64(path: string) -> string is
+    if path == "" || !fs::exists(path) is return "" end
+    let b: shx::Out = shx::run(["base64", "-w0", path])
+    if b.code != 0 || string_trim(b.stdout) == "" is return "" end
+    return "data:image/png;base64," + string_trim(b.stdout)
+end
+
+fn details_json(pid: string, name: string, source: string, d: Det, rating: string, local_rating: string) -> string is
+    let o = jx::ob()
+    jx::p_str(o, "id", pid)
+    jx::p_str(o, "name", name)
+    jx::p_str(o, "source", source)
+    jx::p_str(o, "package_id", pid)
+    jx::p_str(o, "summary", d.summary)
+    jx::p_str(o, "description", d.description)
+    jx::p_opt(o, "icon", d.icon, d.icon != "")
+    jx::p_strs(o, "screenshots", d.shots)
+    jx::p_opt(o, "version", d.version, d.version != "")
+    jx::p_opt(o, "license", d.license, d.license != "")
+    jx::p_opt(o, "homepage", d.homepage, d.homepage != "")
+    jx::p_strs(o, "categories", d.cats)
+    jx::p_opt(o, "size", d.size, d.size != "")
+    jx::p_raw(o, "rating", rating)
+    jx::p_raw(o, "local_rating", local_rating)
+    jx::p_opt(o, "confinement", d.confinement, d.confinement != "")
+    return jx::ob_end(o)
+end
+
+pub fn cmd_get_app_details(args: string) -> shx::Res is
+    let pid_raw: string = jx::get_str(args, "packageId")
+    let source: string = jx::get_str(args, "source")
+    let nm: string = jx::get_str(args, "name")
+    let name: string = if nm != "" then nm else pid_raw
+    let mut d: Det = det_empty()
+    let v: shx::Res = security::validate_pkg_token(pid_raw)
+    if !v.ok is
+        d.summary = v.err
+        d.description = v.err
+        return shx::ok(details_json(pid_raw, name, source, d, "null", "null"))
+    end
+    let pid: string = v.val
+    if source == "flatpak" is
+        let info: string = curated::flatpak_remote_info(pid)
+        d.version = jx::get_str(info, "version")
+        d.size = jx::get_str(info, "size")
+        d.icon = single_flatpak_icon(pid)
+        if ensure_appstream().ok is
+            let j: string = appstream_get(pid)
+            if j != "" is d = enrich_appstream(d, j) end
+        end
+    end
+    if source == "apt" is
+        let info: string = pkgbackend::show_info(pid)
+        d.version = jx::get_str(info, "version")
+        d.size = jx::get_str(info, "size")
+        d.icon = single_apt_icon(pid)
+        if ensure_appstream().ok is
+            let j1: string = appstream_get(pid)
+            let j: string = if j1 != "" then j1 else appstream_get(pid + ".desktop")
+            if j != "" is d = enrich_appstream(d, j) end
+        end
+        if d.summary == "" is
+            let ds: string = string_trim(jx::get_str(info, "description"))
+            if ds != "" is
+                d.summary = ds
+                d.description = ds
+            end
+        end
+    end
+    if source == "snap" is
+        let o: shx::Out = shx::run_timeout(["snap", "info", pid], 6)
+        if o.spawned && !o.timed_out is d = parse_snap_info(d, o.stdout) end
+        d.icon = snapcraft_icon(pid)
+    end
+    if source == "brew" is
+        let o2: shx::Out = shx::run_timeout(["brew", "info", "--json=v2", pid], 6)
+        if o2.spawned && !o2.timed_out && jwalk::is_obj(o2.stdout) is d = parse_brew_info(d, o2.stdout) end
+    end
+    if source == "hpm" is
+        let info: string = hpm::info(pid)
+        if info != "" is
+            d.version = jx::get_str(info, "version")
+            d.summary = jx::get_str(info, "summary")
+            d.description = jx::get_str(info, "description")
+            d.license = jx::get_str(info, "license")
+            d.cats = jx::get_strs(info, "tags")
+        end
+    end
+    if source == "nix" is
+        let info: string = hnm::info(pid)
+        if info != "" is
+            d.version = jx::get_str(info, "version")
+            d.summary = jx::get_str(info, "summary")
+            d.description = jx::get_str(info, "description")
+            d.homepage = jx::get_str(info, "homepage")
+            d.license = jx::get_str(info, "license")
+        end
+    end
+    if source == "appimage" is
+        let entry: string = appimage::feed_entry(pid)
+        if entry != "" is
+            let de: string = jx::get_str(entry, "description")
+            d.summary = hpm::take_chars(de, 140)
+            d.description = de
+            d.homepage = jx::get_str(entry, "homepage")
+            d.cats = jx::get_strs(entry, "categories")
+        end
+        if d.homepage == "" is d.homepage = "https://github.com/" + pid end
+        let inst: string = appimage::is_installed(pid)
+        if inst != "" is
+            d.version = jx::get_str(inst, "version")
+            d.icon = file_icon_b64(jx::get_str(inst, "icon_path"))
+        end
+    end
+    if d.summary == "" && d.description != "" is d.summary = hpm::take_chars(d.description, 140) end
+    if d.description == "" && d.summary != "" is d.description = d.summary end
+    let mut rating: string = "null"
+    if settings::current().ratings_enabled && source == "flatpak" is rating = fetch_rating(pid) end
+    return shx::ok(details_json(pid, name, source, d, rating, ratings::local_rating_json(source, pid)))
+end
