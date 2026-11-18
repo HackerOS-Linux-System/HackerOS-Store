@@ -1,0 +1,50 @@
+use "std -> fs" from "fs"
+mod jx
+mod shx
+mod pkgbackend
+mod hpm
+mod hnm
+
+fn b(v: bool) -> shx::Res is
+    return shx::ok(if v then "true" else "false")
+end
+
+pub fn cmd_is_brew_available(args: string) -> shx::Res is return b(shx::has("brew")) end
+pub fn cmd_is_flatpak_available(args: string) -> shx::Res is return b(shx::has("flatpak")) end
+pub fn cmd_is_snap_available(args: string) -> shx::Res is return b(shx::has("snap")) end
+pub fn cmd_is_hacker_available(args: string) -> shx::Res is return b(shx::has("hacker")) end
+pub fn cmd_is_podman_available(args: string) -> shx::Res is return b(shx::has("podman")) end
+pub fn cmd_is_hpm_available(args: string) -> shx::Res is return b(hpm::is_available()) end
+pub fn cmd_is_nix_available(args: string) -> shx::Res is return b(hnm::is_available()) end
+pub fn cmd_is_apt_available(args: string) -> shx::Res is return b(pkgbackend::is_available()) end
+
+pub fn cmd_get_app_info(args: string) -> shx::Res is
+    let o = jx::ob()
+    jx::p_str(o, "version", "0.8.0")
+    jx::p_str(o, "name", "HackerOS Store")
+    jx::p_str(o, "target_release", "Debian trixie (testing) and forks")
+    jx::p_str(o, "pkg_backend", pkgbackend::backend_display_label())
+    return shx::ok(jx::ob_end(o))
+end
+
+pub fn cmd_clear_cache(args: string) -> shx::Res is
+    shx::emit_log("info", "Clearing package manager caches...")
+    shx::emit_prog("cache", "Clearing caches...", 0.2)
+
+    pkgbackend::clean()
+    shx::emit_prog("cache", "Cleared " + pkgbackend::backend_label() + " cache...", 0.45)
+
+    shx::run_streaming(["flatpak", "uninstall", "-y", "--user", "--unused"])
+    shx::priv_run(["flatpak", "uninstall", "-y", "--unused"])
+    shx::emit_prog("cache", "Cleared unused Flatpak runtimes...", 0.7)
+
+    let launchers: string = shx::home() + "/.hackeros/launchers"
+    if fs::is_dir(launchers) is
+        shx::run(["find", launchers, "-mindepth", "2", "-maxdepth", "2", "-name", "installer.exe", "-type", "f", "-delete"])
+    end
+    shx::emit_prog("cache", "Cleared downloaded Wine installers...", 0.9)
+
+    shx::emit_prog("done", "Cache cleared.", 1.0)
+    shx::emit_log("success", "Caches cleared successfully.")
+    return shx::ok(jx::quote("Caches cleared successfully."))
+end
